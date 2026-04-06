@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aio_rtsp"
+version = "0.1.0"
+description = "Async RTSP client with protocol timing, RTP packet events, and audio/video frame callbacks"
+readme = "README.md"
+authors = [{name = "yinkaisheng", email = "yinkaisheng@foxmail.com"}]
+license = {text = "Apache-2.0"}
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+]
+requires-python = ">=3.8"
+keywords = ["asyncio", "rtsp", "rtp", "streaming", "video", "audio"]
+dependencies = ["aio-sockets"]
+
+[project.optional-dependencies]
+audio = ["numpy", "sounddevice"]
+decode = ["av"]
+playback = ["numpy", "sounddevice", "av"]
+
+[project.urls]
+Homepage = "https://github.com/yinkaisheng/aio-rtsp"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["aio_rtsp"]
