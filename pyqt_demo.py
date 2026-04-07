@@ -84,8 +84,8 @@ class RtspPlayerThread(QtCore.QThread):
         try:
             self._play()
         except Exception as ex:
-            self.log_ready.emit(f"{Tick.process_tick()} playback thread error: {ex!r}")
-            self.log_ready.emit(traceback.format_exc().rstrip())
+            self.log_ready.emit(f"{Tick.process_tick()} playback thread error: {ex!r}"
+                                f"\n{traceback.format_exc()}")
         finally:
             self.playing_changed.emit(False)
 
@@ -122,10 +122,13 @@ class RtspPlayerThread(QtCore.QThread):
                     if event.exception is None:
                         self.log_ready.emit(
                             f"{Tick.process_tick()} RTSP connected, local addr={event.local_addr}, cost={event.elapsed}s"
+                            f", session elapsed={event.session_elapsed}s"
                         )
                     else:
                         self.log_ready.emit(
-                            f"{Tick.process_tick()} RTSP connect failed, local addr={event.local_addr}, cost={event.elapsed}s, ex={event.exception!r}"
+                            f"{Tick.process_tick()} RTSP connect failed, local addr={event.local_addr}, cost={event.elapsed}s"
+                            f", session elapsed={event.session_elapsed}s"
+                            f", ex={event.exception!r}"
                         )
                     if event.local_addr is None:
                         break
@@ -232,25 +235,25 @@ class RtspPlayerThread(QtCore.QThread):
                     audio_player.feed(aframe)
 
                 elif isinstance(event, ClosedEvent):
-                    self.log_ready.emit(f"{Tick.process_tick()} rtsp closed")
+                    self.log_ready.emit(f"{Tick.process_tick()} rtsp closed, session elapsed={event.session_elapsed}s")
                     self.clear_video.emit()
                     break
 
                 elif isinstance(event, aiortsp.RtspTimeoutError):
                     self.log_ready.emit(f'{Tick.process_tick()} rtsp timeout: {event!r}'
-                                        f'\n{"".join(traceback.format_exception(event))}')
+                                        f'\n{"".join(traceback.format_exception(type(event), event, event.__traceback__))}')
                     self.clear_video.emit()
                     break
 
                 elif isinstance(event, aiortsp.RtspConnectionError):
                     self.log_ready.emit(f'{Tick.process_tick()} rtsp connection error: {event!r}'
-                                        f'\n{"".join(traceback.format_exception(event))}')
+                                        f'\n{"".join(traceback.format_exception(type(event), event, event.__traceback__))}')
                     self.clear_video.emit()
                     break
 
                 elif isinstance(event, Exception):
                     self.log_ready.emit(f'{Tick.process_tick()} other exception: {event!r}'
-                                        f'\n{"".join(traceback.format_exception(event))}')
+                                        f'\n{"".join(traceback.format_exception(type(event), event, event.__traceback__))}')
                     self.clear_video.emit()
                     break
         finally:
@@ -273,12 +276,15 @@ class RtspPlayerThread(QtCore.QThread):
 
     def _log_rtsp(self, event: RtspMethodEvent) -> None:
         self.log_ready.emit(
-            f"{Tick.process_tick()} RTSP {event.method} status={event.status_code}, elapsed={event.elapsed}s"
+            f"{Tick.process_tick()} RTSP {event.method} status={event.status_code}"
+            f", cost={event.elapsed}s, session elapsed={event.session_elapsed}s"
         )
 
 
 class MainWindow(QtWidgets.QWidget):
     SESSION_FILE = Path(__file__).with_name("session.txt")
+    MAX_HISTORY_URLS = 20
+    RTSP_TIMEOUT = 5
 
     def __init__(self):
         super().__init__()
@@ -292,12 +298,17 @@ class MainWindow(QtWidgets.QWidget):
 
         self.video_label = VideoLabel()
 
-        self.url_edit = QtWidgets.QLineEdit("rtsp://")
-        self.url_edit.setPlaceholderText("RTSP address")
+        self.url_edit = QtWidgets.QComboBox()
+        self.url_edit.setEditable(True)
+        self.url_edit.setInsertPolicy(QtWidgets.QComboBox.NoInsert)
+        self.url_edit.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        self.url_edit.setMinimumContentsLength(30)
+        self.url_edit.setCurrentText("rtsp://")
+        self.url_edit.lineEdit().setPlaceholderText("RTSP address")
 
         self.timeout_spin = QtWidgets.QSpinBox()
         self.timeout_spin.setRange(1, 3600)
-        self.timeout_spin.setValue(10)
+        self.timeout_spin.setValue(self.RTSP_TIMEOUT)
         self.timeout_spin.setSuffix(" s")
 
         self.video_check = QtWidgets.QCheckBox("Video")
@@ -343,7 +354,7 @@ class MainWindow(QtWidgets.QWidget):
         self.stop_button.clicked.connect(lambda: self.stop_play())
 
     def start_play(self) -> None:
-        rtsp_url = self.url_edit.text().strip()
+        rtsp_url = self.url_edit.currentText().strip()
         if not rtsp_url:
             self.append_log("Please enter an RTSP URL")
             return
@@ -434,15 +445,30 @@ class MainWindow(QtWidgets.QWidget):
     def _load_last_rtsp_url(self) -> None:
         try:
             if self.SESSION_FILE.exists():
-                last_url = self.SESSION_FILE.read_text(encoding="utf-8").strip()
-                if last_url:
-                    self.url_edit.setText(last_url)
+                lines = [
+                    line.strip()
+                    for line in self.SESSION_FILE.read_text(encoding="utf-8").splitlines()
+                    if line.strip()
+                ]
+                if lines:
+                    self.url_edit.clear()
+                    self.url_edit.addItems(lines[:self.MAX_HISTORY_URLS])
+                    self.url_edit.setCurrentIndex(0)
         except OSError:
             pass
 
     def _save_last_rtsp_url(self, rtsp_url: str) -> None:
         try:
-            self.SESSION_FILE.write_text(rtsp_url, encoding="utf-8")
+            history = [rtsp_url]
+            for index in range(self.url_edit.count()):
+                item = self.url_edit.itemText(index).strip()
+                if item and item != rtsp_url:
+                    history.append(item)
+            history = history[:self.MAX_HISTORY_URLS]
+            self.url_edit.clear()
+            self.url_edit.addItems(history)
+            self.url_edit.setCurrentIndex(0)
+            self.SESSION_FILE.write_text("\n".join(history) + "\n", encoding="utf-8")
         except OSError as ex:
             self.append_log(f"save session failed: {ex!r}")
 

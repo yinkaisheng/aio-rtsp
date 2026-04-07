@@ -1,60 +1,48 @@
 # aio-rtsp
 
-💡 Overview
+`aio-rtsp` is an asyncio-based RTSP toolkit for Python. It provides:
 
-aio-rtsp is an asynchronous RTSP client library for Python built on top of `asyncio` and `aio-sockets`. Unlike media-player-oriented wrappers, it exposes the protocol and media timeline directly, so you can observe RTSP method latency, RTP packet timing, raw audio/video frame boundaries, and frame-level receive cost in one place.
+- An RTSP client that exposes connection events, RTSP method timing, RTP packets, and assembled audio/video frames
+- A lightweight RTSP/TCP server that publishes local media files from a directory tree
 
-This library is useful when you need more than just playback: device diagnostics, stream quality analysis, first-frame measurement, packet loss inspection, custom decoders, and embedding RTSP session handling into your own async applications.
+It is aimed at cases where "can play" is not enough and you also want visibility into protocol timing, packet flow, frame boundaries, and first-frame behavior.
 
-✨ Features
+## Highlights
 
-Typed Event Stream: Consume connection, RTSP, RTP, video frame, audio frame, and close events from one async iterator.
+- One async event stream for connect, RTSP, RTP, video, audio, and close events
+- Per-method timing for `OPTIONS`, `DESCRIBE`, `SETUP`, `PLAY`, and `TEARDOWN`
+- H.264 / H.265 video frame splicing to raw Annex B NAL units
+- Audio frame extraction for AAC, G.711 A-law, and G.711 mu-law style RTSP streams
+- Simple embedded RTSP server for local files
+- Session API that works cleanly with `async with`
 
-Protocol Timing Visibility: Measure RTSP connect latency and per-method elapsed time for `OPTIONS`, `DESCRIBE`, `SETUP`, `PLAY`, and `TEARDOWN`.
+Timing values such as `session_elapsed`, RTSP `elapsed`, and RTP `recv_tick` are process-local monotonic durations. They are not wall-clock timestamps.
 
-Frame-Level Metadata: Video and audio frames expose RTP timestamps, sequence ranges, receive cost, corruption hints, and missing sequence information.
+## Installation
 
-H.264 and H.265 Frame Splicing: RTP payloads are reassembled into raw Annex B NAL units that can be passed into decoders such as PyAV.
-
-Audio Frame Support: Includes frame extraction for raw audio, AAC, G.711 A-law, and G.711 mu-law style RTSP audio streams.
-
-Embeddable Session API: Use `RtspSession` directly, integrate it with `async with`, and stop it from your own threading or asyncio control flow.
-
-Tick Semantics: Timing values such as `session_elapsed`, RTSP `elapsed`, and RTP `recv_tick` are process-local monotonic times relative to process startup or session start. They are not wall-clock timestamps.
-
-📦 Installation
-
-Install from PyPI:
+Base install:
 
 ```shell
-pip install aio-rtsp aio-sockets
+pip install aio-rtsp
 ```
 
 Optional extras:
 
 ```shell
+pip install aio-rtsp[server]
 pip install aio-rtsp[audio]
-pip install aio-rtsp[decode]
-pip install aio-rtsp[playback]
+pip install aio-rtsp[all]
 ```
 
-Extra meanings:
+- `[server]`: installs `av` for RTSP file serving
+- `[audio]`: installs `numpy`, `sounddevice`, and `av` for audio playback helpers
+- `[all]`: installs all optional dependencies
 
-`[audio]`: installs `numpy` and `sounddevice` for audio playback helpers.
+## Quick Start
 
-`[decode]`: installs `av` for codecs that require packet decoding, such as AAC or AAC-LATM.
+### Client
 
-`[playback]`: installs both playback and decode dependencies.
-
-If you are working from a local checkout instead of PyPI, install `aio-sockets` first and run your scripts from the repository root, or add the repository root to `PYTHONPATH`.
-
-## Usage
-
-### Basic Session Example
-
-The example below opens an RTSP session and prints the main protocol and media events.
-
-If the RTSP stream requires authentication, include the credentials in the URL, for example `rtsp://user:password@192.168.1.122:554/stream`. If the username or password contains reserved URL characters such as `@`, `:`, or `/`, encode them first.
+If the RTSP stream requires authentication, include credentials in the URL, for example `rtsp://user:password@192.168.1.122:554/stream`. If the username or password contains reserved characters such as `@`, `:`, or `/`, URL-encode them first.
 
 ```python
 import asyncio
@@ -62,89 +50,111 @@ import aio_rtsp
 
 
 async def main():
-    async with aio_rtsp.RtspSession("rtsp://127.0.0.1:554/stream", timeout=10) as session:
+    async with aio_rtsp.RtspSession("rtsp://127.0.0.1:8554/zhongli.wav", timeout=5) as session:
         async for event in session.iter_events():
             if isinstance(event, aio_rtsp.ConnectResultEvent):
                 print("connected:", event.local_addr, "elapsed:", event.elapsed)
             elif isinstance(event, aio_rtsp.RtspMethodEvent):
-                print(event.method, event.status_code, event.elapsed)
+                print(event.method, event.status_code, event.elapsed, event.session_elapsed)
             elif isinstance(event, aio_rtsp.VideoFrameEvent):
-                frame = event.frame
-                print("video", frame.timestamp, frame.first_seq.num, frame.last_seq.num)
+                print("video ts=", event.frame.timestamp, "size=", len(event.frame.data))
             elif isinstance(event, aio_rtsp.AudioFrameEvent):
-                frame = event.frame
-                print("audio", frame.timestamp, frame.sample_rate, frame.sample_count)
+                print("audio ts=", event.frame.timestamp, "samples=", event.frame.sample_count)
             elif isinstance(event, aio_rtsp.ClosedEvent):
-                print("session closed after", event.elapsed, "seconds")
+                print("closed after", event.session_elapsed, "seconds")
 
 
 asyncio.run(main())
 ```
 
-### Video-Only or Audio-Only Sessions
+### Server
 
-You can limit the session to only one media type at setup time.
+Publish a directory recursively:
 
-```python
-import asyncio
-import aio_rtsp
-
-
-async def video_only():
-    async with aio_rtsp.RtspSession(
-        "rtsp://127.0.0.1:554/stream",
-        enable_video=True,
-        enable_audio=False,
-    ) as session:
-        async for event in session.iter_events():
-            if isinstance(event, aio_rtsp.VideoFrameEvent):
-                print("video frame", event.frame.timestamp)
-
-
-async def audio_only():
-    async with aio_rtsp.RtspSession(
-        "rtsp://127.0.0.1:554/stream",
-        enable_video=False,
-        enable_audio=True,
-    ) as session:
-        async for event in session.iter_events():
-            if isinstance(event, aio_rtsp.AudioFrameEvent):
-                print("audio frame", event.frame.timestamp)
-
-
-asyncio.run(video_only())
+```shell
+python server_demo.py --dir ./media --host 0.0.0.0 --port 8554
 ```
 
-### Stop a Session from Another Thread
+Each file becomes an RTSP resource under the same relative path:
 
-`iter_events()` accepts any stop object that provides `is_set()`, so both `threading.Event` and `asyncio.Event` work.
+```text
+rtsp://127.0.0.1:8554/eagle-h264.mp4
+rtsp://127.0.0.1:8554/subdir/example.wav
+```
+
+Run the server from Python:
 
 ```python
 import asyncio
-import threading
 import aio_rtsp
 
 
 async def main():
-    stop_event = threading.Event()
-
-    async with aio_rtsp.open_session("rtsp://127.0.0.1:554/stream", timeout=10) as session:
-        async for event in session.events(stop_event):
-            print(event.event, event.session_elapsed)
-            if event.session_elapsed > 5:
-                stop_event.set()
+    await aio_rtsp.serve("./media", host="0.0.0.0", port=8554)
 
 
 asyncio.run(main())
 ```
 
-### Decode Raw Video Frames with PyAV
+## RTSP Server
 
-`VideoFrameEvent.frame.data` contains Annex B byte stream data, which can be passed into PyAV after you initialize the codec from the SDP information.
+Current server behavior:
+
+- Transport is RTSP over TCP with interleaved RTP/RTCP only
+- Files are resolved relative to the configured root directory
+- Files outside the root are rejected
+- Unsupported codecs are skipped rather than transcoded
+
+### Supported Inputs
+
+Accepted file extensions:
+
+- `.mp4`
+- `.mkv`
+- `.wav`
+- `.aac`
+
+Supported media handling:
+
+- Video: H.264 and H.265
+- AAC audio: served as `mpeg4-generic`
+- WAV audio: WAV input is decoded, resampled with PyAV, and served as `PCMA/8000/1`
+- `PCMU` is not advertised by the current server implementation
+
+For `.mp4`, `.mkv`, `.aac`, and `.wav`, the server requires PyAV.
+
+### Loop Control
+
+Use the `play_count` query parameter:
+
+```text
+rtsp://127.0.0.1:8554/zhongli.wav?play_count=1
+rtsp://127.0.0.1:8554/zhongli.wav?play_count=2
+rtsp://127.0.0.1:8554/zhongli.wav?play_count=0
+```
+
+- `play_count=1`: play once, then close
+- `play_count=2`: play twice, then close
+- `play_count=0`: loop forever
+- omitted `play_count`: same as `0`
+
+## RTSP Client
+
+### Session Notes
+
+- Use `enable_video=False` or `enable_audio=False` for single-media sessions
+- At least one of `enable_video` or `enable_audio` must be `True`
+- `iter_events(stop_event)` accepts `threading.Event` or `asyncio.Event`
+- `VideoFrameEvent.frame.data` contains raw Annex B video data
+
+### PyAV Decode Example
+
+Use this pattern if you want to decode video frames after `DESCRIBE`:
 
 ```python
 import asyncio
 import fractions
+
 import av
 import aio_rtsp
 
@@ -153,7 +163,7 @@ async def main():
     codec = None
     time_base = fractions.Fraction(1, 90000)
 
-    async with aio_rtsp.RtspSession("rtsp://127.0.0.1:554/stream", timeout=10) as session:
+    async with aio_rtsp.RtspSession("rtsp://127.0.0.1:8554/morning_h264.mp4", timeout=5) as session:
         async for event in session.iter_events():
             if isinstance(event, aio_rtsp.RtspMethodEvent) and event.method == "DESCRIBE":
                 video_sdp = event.response.sdp.get("video", {})
@@ -167,7 +177,7 @@ async def main():
                         if extra:
                             codec.parse(extra)
 
-            if isinstance(event, aio_rtsp.VideoFrameEvent) and codec is not None:
+            elif isinstance(event, aio_rtsp.VideoFrameEvent) and codec is not None:
                 for packet in codec.parse(event.frame.data):
                     packet.pts = packet.dts = event.frame.timestamp
                     packet.time_base = time_base
@@ -180,90 +190,69 @@ asyncio.run(main())
 
 ### Optional Audio Playback Helpers
 
-The package also includes `aio_rtsp.audio_playback.SoundDeviceAudioPlayer`.
+`aio_rtsp.audio_playback.SoundDeviceAudioPlayer` can decode and play audio frames.
 
-- It requires `numpy` and `sounddevice` for playback output.
-- It does not require PyAV for G.711 A-law or mu-law playback.
-- It does require PyAV for codecs such as AAC or AAC-LATM.
+- Install the `[audio]` extra for `numpy`, `sounddevice`, and `av`
+- G.711 A-law and mu-law playback do not require PyAV
+- AAC and AAC-LATM playback do require PyAV
 
-If an optional dependency is missing, the module raises a runtime error with the exact `pip install` command to use.
+## Demos
 
-### PyQt Playback Demo
+### PyQt Demo
 
-This repository includes `pyqt_demo.py`, which shows how to consume `RtspSession` events, decode video with PyAV, and play audio with `sounddevice`.
+`pyqt_demo.py` shows how to consume `RtspSession` events, decode video with PyAV, and play audio with `sounddevice`.
 
-![PyQt Demo](images/pyqt5demo.png)
+It also requires `PyQt5` in addition to the `[audio]` extra.
+
+![PyQt Demo](images/pyqt5demo.gif)
 
 ```shell
 python pyqt_demo.py
 ```
 
-### CLI Decode Demo
+### CLI Demo
 
-This repository also includes `cli_demo.py`, which logs RTSP timing, writes raw video to disk, and decodes frames with PyAV.
+`cli_demo.py` logs RTSP timing, writes raw video to disk, and decodes frames with PyAV.
+
+Install the `[all]` extra for PyAV, then add `Pillow` if you want to save the first decoded frame as an image.
 
 ```shell
-python cli_demo.py -u rtsp://127.0.0.1:554/stream
+python cli_demo.py -u rtsp://127.0.0.1:8554/morning_h264.mp4
 ```
 
-## API
+## API Summary
 
 ### `RtspSession(rtsp_url, forward_address=None, timeout=4, log_type=RtspClientMsgType.RTSP, enable_video=True, enable_audio=True)`
 
-Create a reusable RTSP session object. Use it with `async with` and consume events through `iter_events()` or `events()`.
+High-level reusable RTSP session object. Use it with `async with` and consume events through `iter_events()`.
 
-At least one of `enable_video` or `enable_audio` must be `True`.
+`forward_address` lets you keep the original RTSP URL while connecting through another TCP endpoint, such as a relay, tunnel, or forwarded host.
 
 ### `RtspSession.iter_events(stop_event=None) -> AsyncGenerator[RtspEvent, None]`
 
-Start the RTSP session, yield typed events, and close the underlying socket when iteration finishes or fails.
+Starts the session, yields typed events, and closes the socket when iteration ends or fails.
 
 ### `open_session(rtsp_url, forward_address=None, timeout=4, log_type=RtspClientMsgType.RTSP, enable_video=True, enable_audio=True) -> RtspSession`
 
-Small helper that returns a `RtspSession` instance.
+Convenience helper that returns a `RtspSession`.
 
-At least one of `enable_video` or `enable_audio` must be `True`.
+### Event Types
 
-### `ConnectResultEvent`
-
-Emitted once after TCP connect attempt. Includes `local_addr`, `exception`, `elapsed`, and `success`.
-
-### `RtspMethodEvent`
-
-Emitted for each RTSP method response. Includes `method`, `media_type`, `response`, `status_code`, and `elapsed`.
-
-### `RtpPacketEvent`
-
-Emitted for each interleaved RTP packet. Includes `channel`, `media_channel`, and parsed `rtp`.
-
-### `VideoFrameEvent`
-
-Emitted for each spliced video frame. `frame` is a `VideoFrame` object with RTP timing and sequence metadata.
-
-### `AudioFrameEvent`
-
-Emitted for each extracted audio frame. `frame` is an `AudioFrame` object with sample rate, channel count, and sample count.
-
-### `ClosedEvent`
-
-Emitted once when the session finishes teardown and the RTSP connection is closing.
+- `ConnectResultEvent`
+- `RtspMethodEvent`
+- `RtpPacketEvent`
+- `VideoFrameEvent`
+- `AudioFrameEvent`
+- `ClosedEvent`
 
 ### Exceptions
 
-`RtspError` is the base exception type.
-
-`RtspConnectionError` is raised when the TCP connection cannot be established.
-
-`RtspTimeoutError` is raised when an RTSP or RTP wait operation times out.
-
-`RtspProtocolError` is raised for parse or transport failures.
-
-`RtspResponseError` is raised when an RTSP method completes with a non-200 status.
+- `RtspError`
+- `RtspConnectionError`
+- `RtspTimeoutError`
+- `RtspProtocolError`
+- `RtspResponseError`
 
 ## Notes
 
-This project is designed around observability of the RTSP and RTP pipeline, not around replacing FFmpeg or PyAV as a general media stack.
-
-If you only need playback, PyAV or ffmpeg-based wrappers may be simpler. If you need protocol timing, raw RTP frame boundaries, and frame-level receive diagnostics, this library gives you direct access to those details.
-
-The current transport path is RTSP over TCP with interleaved RTP/RTCP.
+If you only need playback, higher-level PyAV or ffmpeg-based wrappers may be simpler. This project is most useful when you need direct access to RTSP/RTP behavior, timing, and frame-level diagnostics.

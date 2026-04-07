@@ -164,12 +164,6 @@ class RtspResponseError(RtspError):
         super().__init__(f'RTSP {target} failed with status {status_code}')
 
 
-def get_session_elapsed(tick: Tick) -> float:
-    """Return elapsed session time without mutating method timing state."""
-
-    return round(Tick.get_tick() - tick.start_tick, 6)
-
-
 class RTP:
     """Parsed RTP header fields and payload data."""
 
@@ -1165,9 +1159,10 @@ a=control:track3
                     break
                 await self.recv_some_to_buffer(timeout=self.timeout)
             else: # tuple
-                # channel, rtp = ret
+                channel, rtp_or_rtcp = ret
                 # some servers send rtp before play response, we need to save them and handle after play response
-                self.rtps_before_play_response.append(ret)
+                if rtp_or_rtcp and isinstance(rtp_or_rtcp, RTP):
+                    self.rtps_before_play_response.append(ret)
 
         rtsp_resp = await self.wait_rstp_respone(timeout=self.timeout)
         rtsp_resp.elapsed = self.tick.since_last()
@@ -1347,7 +1342,7 @@ class RtspSession:
 
     Args:
         rtsp_url: RTSP URL to connect to.
-        forward_address: Optional TCP target used instead of the parsed RTSP host.
+        forward_address: Optional TCP target used instead of the parsed RTSP host, see `open_session`.
         timeout: Timeout in seconds for connection, RTSP methods, and RTP receive waits.
         log_type: Bit flags from :class:`RtspClientMsgType` controlling low-level logging.
         enable_video: Whether to SETUP and emit video stream events.
@@ -1436,7 +1431,7 @@ class RtspSession:
             yield ConnectResultEvent(
                 event='connect_result',
                 msg_type=RtspClientMsgType.ConnectResult,
-                session_elapsed=get_session_elapsed(rtsp.tick),
+                session_elapsed=rtsp.tick.since_start(),
                 local_addr=rtsp.local_addr,
                 exception=ex,
                 elapsed=connect_elapsed,
@@ -1476,6 +1471,7 @@ class RtspSession:
             if rtsp.rtps_before_play_response:
                 logfunc(f'got {len(rtsp.rtps_before_play_response)} rtp packets before play response')
                 for channel, rtp in rtsp.rtps_before_play_response:
+                    logfunc(f'{channel}: {rtp}')
                     rtp.recv_tick = Tick.process_tick()
                     yield self._new_rtp_event(channel, rtp)
                 rtsp.rtps_before_play_response.clear()
@@ -1494,7 +1490,7 @@ class RtspSession:
             yield ClosedEvent(
                 event='closed',
                 msg_type=RtspClientMsgType.Closed,
-                session_elapsed=get_session_elapsed(rtsp.tick),
+                session_elapsed=rtsp.tick.since_start(),
             )
         finally:
             await self.close()
@@ -1511,7 +1507,7 @@ class RtspSession:
         return RtspMethodEvent(
             event='rtsp_method',
             msg_type=RtspClientMsgType.RTSP,
-            session_elapsed=get_session_elapsed(self._client.tick),
+            session_elapsed=self._client.tick.since_start(),
             method=method,
             response=response,
             media_type=media_type,
@@ -1521,7 +1517,7 @@ class RtspSession:
         return RtpPacketEvent(
             event='rtp_packet',
             msg_type=RtspClientMsgType.RTP,
-            session_elapsed=get_session_elapsed(self._client.tick),
+            session_elapsed=self._client.tick.since_start(),
             channel=channel,
             media_channel=self._client.media_channels[channel],
             rtp=rtp,
@@ -1560,7 +1556,7 @@ class RtspSession:
                     yield VideoFrameEvent(
                         event='video_frame',
                         msg_type=RtspClientMsgType.VideoFrame,
-                        session_elapsed=get_session_elapsed(rtsp.tick),
+                        session_elapsed=rtsp.tick.since_start(),
                         frame=vframe,
                     )
                 rtsp.shrink_buffer()
@@ -1572,7 +1568,7 @@ class RtspSession:
                         yield AudioFrameEvent(
                             event='audio_frame',
                             msg_type=RtspClientMsgType.AudioFrame,
-                            session_elapsed=get_session_elapsed(rtsp.tick),
+                            session_elapsed=rtsp.tick.since_start(),
                             frame=aframe,
                         )
                 rtsp.shrink_buffer()

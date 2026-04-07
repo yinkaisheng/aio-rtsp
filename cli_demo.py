@@ -8,8 +8,8 @@ from typing import Tuple, List, AsyncGenerator, Any
 import aio_sockets as aio
 import aio_rtsp as aiortsp
 from aio_rtsp import AudioFrameEvent, ClosedEvent, ConnectResultEvent, RtspMethodEvent, Tick, VideoFrameEvent, open_session
-from log_util import Fore, log
 from aio_rtsp.audio_playback import SoundDeviceAudioPlayer
+from log_util import Fore, log
 
 
 aio.aio_sockets.logfunc = log
@@ -54,7 +54,7 @@ def pyav_play(rtsp_url: str, forward_address: aio.IPAddress, play_time: int, tim
     got_i_frame = False
     fout: io.TextIOWrapper = None
     codec_name_lower = ''
-    input_video_frames = []
+    input_video_frames: List[aiortsp.VideoFrame] = []
     output_video_frame_timestmaps = set()
     decode_fail_count = 0
     last_decoded_frame: av.VideoFrame = None
@@ -186,7 +186,7 @@ def pyav_play(rtsp_url: str, forward_address: aio.IPAddress, play_time: int, tim
 
         max_recv_cost = 0
         max_interval = 0
-        frames2: List[VideoFrame] = []
+        frames2: List[aiortsp.VideoFrame] = []
         for vframe in input_video_frames:
             if len(frames2) == 0:
                 frames2.append(vframe)

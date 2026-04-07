@@ -1,19 +1,18 @@
 import asyncio
-import audioop
 import base64
 import binascii
 import contextlib
 import random
 import struct
 import time
+import traceback
 import urllib.parse
-import wave
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from .client import H264CodecName, H265CodecName
+import aio_sockets as aio
 
 try:
     import av
@@ -21,10 +20,18 @@ except Exception:  # pragma: no cover - optional dependency at runtime
     av = None
 
 
+H264CodecName = 'h264'
+H265CodecName = 'h265'
+HEVCCodecName = 'hevc'
+
 ALLOWED_EXTENSIONS = {".mp4", ".mkv", ".wav", ".aac"}
 DEFAULT_USER_AGENT = "python aio rtsp server"
 MAX_RTP_PAYLOAD = 1400
 logfunc = print
+
+
+def _is_disconnect_error(ex: BaseException) -> bool:
+    return isinstance(ex, (BrokenPipeError, ConnectionResetError, ConnectionAbortedError))
 
 
 def format_date_header() -> str:
@@ -187,12 +194,12 @@ def parse_parameter_sets(codec_name: str, extradata: bytes) -> Tuple[int, Dict[s
 def extract_nalus(codec_name: str, payload: bytes, nal_length_size: int) -> List[bytes]:
     if not payload:
         return []
-    if payload.startswith(b"\x00\x00\x00\x01") or payload.startswith(b"\x00\x00\x01"):
-        return split_annexb_nalus(payload)
     if normalize_codec_name(codec_name) in (H264CodecName, H265CodecName):
         nalus = split_length_prefixed_nalus(payload, nal_length_size)
         if nalus:
             return nalus
+    if payload.startswith(b"\x00\x00\x00\x01") or payload.startswith(b"\x00\x00\x01"):
+        return split_annexb_nalus(payload)
     return [payload]
 
 
@@ -206,16 +213,12 @@ def to_base64(nalu: bytes) -> str:
     return base64.b64encode(nalu).decode("ascii")
 
 
-def pcm_to_pcma(data: bytes, sample_width: int, channels: int, sample_rate: int) -> bytes:
-    if channels > 1:
-        mono = audioop.tomono(data, sample_width, 0.5, 0.5)
-    else:
-        mono = data
-    if sample_rate != 8000:
-        mono, _ = audioop.ratecv(mono, sample_width, 1, sample_rate, 8000, None)
-    if sample_width != 2:
-        mono = audioop.lin2lin(mono, sample_width, 2)
-    return audioop.lin2alaw(mono, 2)
+def _iter_audio_frames(value):
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    return [value]
 
 
 def adts_to_asc(data: bytes) -> bytes:
@@ -269,8 +272,6 @@ class MediaSource:
                 )
             elif track.codec_name == "pcma":
                 lines.append("a=rtpmap:8 PCMA/8000/1")
-            elif track.codec_name == "pcmu":
-                lines.append("a=rtpmap:0 PCMU/8000/1")
             else:
                 lines.append(
                     f"a=rtpmap:{track.payload_type} {track.codec_name.upper()}/{track.clock_rate}/{track.channels}"
@@ -294,6 +295,8 @@ class StreamTrackState:
     sent_codec_config: bool = False
     sample_cursor: int = 0
     logged_first_frame: bool = False
+    media_time_offset: float = 0.0
+    packet_time_cursor: float = 0.0
 
 
 class RtspServerError(Exception):
@@ -301,11 +304,10 @@ class RtspServerError(Exception):
 
 
 class RtspServerSession:
-    def __init__(self, server: "RtspServer", reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+    def __init__(self, server: "RtspServer", sock: aio.TCPSocket):
         self.server = server
-        self.reader = reader
-        self.writer = writer
-        self.peername = writer.get_extra_info("peername")
+        self.sock = sock
+        self.peername = sock.getpeername()
         self.session_id = f"{random.getrandbits(32):08X}"
         self.write_lock = asyncio.Lock()
         self.media_source: Optional[MediaSource] = None
@@ -313,6 +315,7 @@ class RtspServerSession:
         self.track_states: Dict[str, StreamTrackState] = {}
         self.stream_task: Optional[asyncio.Task] = None
         self.closed = False
+        self.play_count = 0
 
     async def run(self) -> None:
         try:
@@ -342,14 +345,19 @@ class RtspServerSession:
                         break
                     else:
                         await self._send_response(headers, 405, "Method Not Allowed")
-                except FileNotFoundError as exc:
-                    logfunc(f"{self.peername} {method} not found: {exc}")
+                except FileNotFoundError as ex:
+                    logfunc(f"{self.peername} {method} not found: {ex}")
                     await self._send_response(headers, 404, "Not Found")
-                except RtspServerError as exc:
-                    logfunc(f"{self.peername} {method} media error: {exc}")
-                    await self._send_response(headers, 415, "Unsupported Media", body=str(exc).encode("utf-8"))
-                except Exception as exc:
-                    logfunc(f"{self.peername} {method} error: {exc!r}")
+                except ValueError as ex:
+                    logfunc(f"{self.peername} {method} bad request: {ex}")
+                    await self._send_response(headers, 400, "Bad Request", body=str(ex).encode("utf-8"))
+                except RtspServerError as ex:
+                    logfunc(f"{self.peername} {method} media error: {ex}")
+                    await self._send_response(headers, 415, "Unsupported Media", body=str(ex).encode("utf-8"))
+                except Exception as ex:
+                    if _is_disconnect_error(ex):
+                        break
+                    logfunc(f"{self.peername} {method} error: {ex!r}\n{traceback.format_exc()}")
                     with contextlib.suppress(Exception):
                         await self._send_response(headers, 500, "Internal Server Error")
         finally:
@@ -358,39 +366,58 @@ class RtspServerSession:
     async def close(self) -> None:
         if self.closed:
             return
-        self.closed = True
         await self._stop_streaming()
+        await self._close_transport()
+
+    async def _close_transport(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
         logfunc(f"{self.peername} disconnected")
-        self.writer.close()
-        with contextlib.suppress(Exception):
-            await self.writer.wait_closed()
+        with contextlib.suppress(BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+            await self.sock.close()
 
     async def _read_request(self):
-        try:
-            raw = await self.reader.readuntil(b"\r\n\r\n")
-        except (asyncio.IncompleteReadError, asyncio.LimitOverrunError):
-            return None
-        if not raw:
-            return None
-        header_text = raw.decode("utf-8", errors="replace")
-        lines = header_text.split("\r\n")
-        if not lines or not lines[0]:
-            return None
-        parts = lines[0].split(" ", 2)
-        if len(parts) != 3:
-            return None
-        method, uri, version = parts
-        headers: Dict[str, str] = {}
-        for line in lines[1:]:
-            if not line or ":" not in line:
+        while not self.closed:
+            try:
+                first = await self.sock.recv_exactly(1)
+            except asyncio.IncompleteReadError:
+                return None
+            if not first:
+                return None
+            if first == b"$":
+                try:
+                    header = await self.sock.recv_exactly(3)
+                    payload_len = struct.unpack("!H", header[1:3])[0]
+                    if payload_len > 0:
+                        await self.sock.recv_exactly(payload_len)
+                except asyncio.IncompleteReadError:
+                    return None
                 continue
-            key, value = line.split(":", 1)
-            headers[key.strip()] = value.strip()
-        content_length = int(headers.get("Content-Length", "0") or "0")
-        body = b""
-        if content_length > 0:
-            body = await self.reader.readexactly(content_length)
-        return method.upper(), uri, version, headers, body
+            try:
+                raw = first + await self.sock.recv_until(b"\r\n\r\n")
+            except (asyncio.IncompleteReadError, asyncio.LimitOverrunError):
+                return None
+            header_text = raw.decode("utf-8", errors="replace")
+            lines = header_text.split("\r\n")
+            if not lines or not lines[0]:
+                return None
+            parts = lines[0].split(" ", 2)
+            if len(parts) != 3:
+                return None
+            method, uri, version = parts
+            headers: Dict[str, str] = {}
+            for line in lines[1:]:
+                if not line or ":" not in line:
+                    continue
+                key, value = line.split(":", 1)
+                headers[key.strip()] = value.strip()
+            content_length = int(headers.get("Content-Length", "0") or "0")
+            body = b""
+            if content_length > 0:
+                body = await self.sock.recv_exactly(content_length)
+            return method.upper(), uri, version, headers, body
+        return None
 
     async def _handle_options(self, req_headers: Dict[str, str]) -> None:
         await self._send_response(
@@ -402,6 +429,7 @@ class RtspServerSession:
 
     async def _handle_describe(self, uri: str, req_headers: Dict[str, str]) -> None:
         resource_path = self.server.resolve_request_path(uri)
+        self.play_count = self.server.parse_play_count(uri)
         self.media_source = self.server.load_media_source(resource_path)
         self.content_base = self.server.build_content_base(uri, req_headers)
         self.track_states = {track.control: StreamTrackState(track) for track in self.media_source.tracks}
@@ -486,6 +514,8 @@ class RtspServerSession:
             state.sent_codec_config = False
             state.sample_cursor = 0
             state.logged_first_frame = False
+            state.media_time_offset = 0.0
+            state.packet_time_cursor = 0.0
 
     async def _stop_streaming(self) -> None:
         if self.stream_task is None:
@@ -497,6 +527,7 @@ class RtspServerSession:
 
     async def _stream_media(self) -> None:
         suffix = self.media_source.file_path.suffix.lower()
+        remaining_plays = self.play_count
         while not self.closed:
             try:
                 if suffix == ".wav":
@@ -505,8 +536,17 @@ class RtspServerSession:
                     await self._stream_container()
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as ex:
+                if _is_disconnect_error(ex):
+                    break
+                logfunc(f"{self.peername} stream error: {ex!r}\n{traceback.format_exc()}")
                 break
+            if remaining_plays > 0:
+                remaining_plays -= 1
+                if remaining_plays == 0:
+                    break
+        if not self.closed and self.play_count > 0 and remaining_plays == 0:
+            await self._close_transport()
 
     async def _stream_container(self) -> None:
         if av is None:
@@ -518,6 +558,7 @@ class RtspServerSession:
         }
         if not stream_states:
             return
+        loop_end_times: Dict[int, float] = {}
         with av.open(str(self.media_source.file_path), mode="r") as container:
             selected_streams = [container.streams[index] for index in stream_states]
             for packet in container.demux(selected_streams):
@@ -532,8 +573,8 @@ class RtspServerSession:
                 packet_time = float(pts * packet.time_base)
                 duration_value = packet.duration
                 if duration_value is None or duration_value <= 0:
-                    average_rate = packet.stream.average_rate
-                    if state.info.media_type == "video" and average_rate:
+                    average_rate = getattr(packet.stream, "average_rate", None) if state.info.media_type == "video" else None
+                    if average_rate:
                         duration_seconds = float(1 / average_rate)
                     elif state.info.media_type == "audio" and state.info.codec_name == "mpeg4-generic":
                         duration_seconds = 1024 / float(state.info.clock_rate or 1)
@@ -541,34 +582,93 @@ class RtspServerSession:
                         duration_seconds = 0.02
                 else:
                     duration_seconds = float(duration_value * packet.time_base)
+                if state.first_source_time is None:
+                    relative_packet_time = 0.0
+                else:
+                    relative_packet_time = max(0.0, packet_time - state.first_source_time)
                 if state.info.media_type == "video":
+                    schedule_time = state.packet_time_cursor
+                    state.packet_time_cursor += max(duration_seconds, 0.0)
+                    loop_end_times[packet.stream.index] = max(
+                        loop_end_times.get(packet.stream.index, 0.0),
+                        state.packet_time_cursor,
+                    )
                     await self._send_video_packet(
                         state,
                         bytes(packet),
-                        packet_time,
+                        schedule_time,
                         duration_seconds,
                         bool(packet.is_keyframe),
                     )
                 elif state.info.codec_name == "mpeg4-generic":
+                    loop_end_times[packet.stream.index] = max(
+                        loop_end_times.get(packet.stream.index, 0.0),
+                        state.media_time_offset + relative_packet_time + max(duration_seconds, 0.0),
+                    )
                     await self._send_aac_packet(state, bytes(packet), packet_time, duration_seconds)
-                elif state.info.codec_name in ("pcma", "pcmu"):
+                elif state.info.codec_name == "pcma":
+                    loop_end_times[packet.stream.index] = max(
+                        loop_end_times.get(packet.stream.index, 0.0),
+                        state.media_time_offset + relative_packet_time + max(duration_seconds, 0.0),
+                    )
                     await self._send_raw_audio_packet(state, bytes(packet), packet_time, duration_seconds)
+        for stream_index, state in stream_states.items():
+            end_time = loop_end_times.get(stream_index)
+            if end_time is not None:
+                state.media_time_offset = end_time
+            state.first_source_time = None
+            state.packet_time_cursor = state.media_time_offset
 
     async def _stream_wav(self) -> None:
+        if av is None:
+            raise RtspServerError("PyAV is required for wav streaming")
         state = next((it for it in self.track_states.values() if it.rtp_channel is not None), None)
         if state is None:
             return
         packet_samples = 160
-        with wave.open(str(self.media_source.file_path), "rb") as wav_file:
-            channels = wav_file.getnchannels()
-            sample_width = wav_file.getsampwidth()
-            sample_rate = wav_file.getframerate()
-            frames_per_read = max(1, int(sample_rate * 0.02))
-            while not self.closed:
-                pcm = wav_file.readframes(frames_per_read)
-                if not pcm:
-                    break
-                encoded = pcm_to_pcma(pcm, sample_width, channels, sample_rate)
+        resampler = av.AudioResampler(format="s16", layout="mono", rate=8000)
+        encoder = av.CodecContext.create("pcm_alaw", "w")
+        encoder.sample_rate = 8000
+        encoder.layout = "mono"
+        encoder.format = "s16"
+        with av.open(str(self.media_source.file_path), mode="r") as container:
+            audio_stream = next((stream for stream in container.streams if stream.type == "audio"), None)
+            if audio_stream is None:
+                raise RtspServerError("No audio stream found in wav file")
+            for packet in container.demux([audio_stream]):
+                if self.closed:
+                    return
+                for decoded_frame in packet.decode():
+                    for resampled_frame in _iter_audio_frames(resampler.resample(decoded_frame)):
+                        for encoded_packet in encoder.encode(resampled_frame):
+                            encoded = bytes(encoded_packet)
+                            offset = 0
+                            while offset < len(encoded):
+                                chunk = encoded[offset:offset + packet_samples]
+                                if not chunk:
+                                    break
+                                offset += len(chunk)
+                                timestamp = state.sample_cursor
+                                state.sample_cursor += len(chunk)
+                                self._log_first_frame(state, timestamp, len(chunk))
+                                await self._sleep_until_media_time(state, timestamp / float(state.info.clock_rate or 1))
+                                await self._send_rtp_packet(state, chunk, timestamp=timestamp, marker=1)
+            for resampled_frame in _iter_audio_frames(resampler.resample(None)):
+                for encoded_packet in encoder.encode(resampled_frame):
+                    encoded = bytes(encoded_packet)
+                    offset = 0
+                    while offset < len(encoded):
+                        chunk = encoded[offset:offset + packet_samples]
+                        if not chunk:
+                            break
+                        offset += len(chunk)
+                        timestamp = state.sample_cursor
+                        state.sample_cursor += len(chunk)
+                        self._log_first_frame(state, timestamp, len(chunk))
+                        await self._sleep_until_media_time(state, timestamp / float(state.info.clock_rate or 1))
+                        await self._send_rtp_packet(state, chunk, timestamp=timestamp, marker=1)
+            for encoded_packet in encoder.encode(None):
+                encoded = bytes(encoded_packet)
                 offset = 0
                 while offset < len(encoded):
                     chunk = encoded[offset:offset + packet_samples]
@@ -585,12 +685,11 @@ class RtspServerSession:
         self,
         state: StreamTrackState,
         data: bytes,
-        packet_time: float,
+        media_time: float,
         duration_seconds: float,
         is_keyframe: bool,
     ) -> None:
-        source_time = self._relative_source_time(state, packet_time)
-        timestamp = int(round(source_time * state.info.clock_rate))
+        timestamp = int(round(media_time * state.info.clock_rate))
         codec_name = normalize_codec_name(state.info.codec_name)
         nalus = extract_nalus(codec_name, data, state.info.nal_length_size)
         if not nalus:
@@ -612,7 +711,7 @@ class RtspServerSession:
         for index, nalu in enumerate(nalus):
             marker = 1 if index == len(nalus) - 1 else 0
             rtp_payloads.extend(self._packetize_video_nalu(nalu, marker=marker, codec_name=codec_name))
-        await self._send_paced_rtp_payloads(state, rtp_payloads, timestamp, source_time, max(duration_seconds, 0.0))
+        await self._send_paced_rtp_payloads(state, rtp_payloads, timestamp, media_time, max(duration_seconds, 0.0))
 
     async def _send_aac_packet(self, state: StreamTrackState, data: bytes, packet_time: float, duration_seconds: float) -> None:
         source_time = self._relative_source_time(state, packet_time)
@@ -631,8 +730,8 @@ class RtspServerSession:
     def _relative_source_time(self, state: StreamTrackState, value: float) -> float:
         if state.first_source_time is None:
             state.first_source_time = value
-            return 0.0
-        return max(0.0, value - state.first_source_time)
+            return state.media_time_offset
+        return state.media_time_offset + max(0.0, value - state.first_source_time)
 
     def _log_first_frame(self, state: StreamTrackState, timestamp: int, size: int) -> None:
         if state.logged_first_frame:
@@ -755,8 +854,12 @@ class RtspServerSession:
         packet = header + payload
         interleaved = b"$" + bytes([state.rtp_channel]) + struct.pack("!H", len(packet)) + packet
         async with self.write_lock:
-            self.writer.write(interleaved)
-            await self.writer.drain()
+            try:
+                await self.sock.send(interleaved)
+            except Exception as ex:
+                if _is_disconnect_error(ex):
+                    raise ConnectionResetError(*getattr(ex, "args", ())) from ex
+                raise
 
     async def _send_response(
         self,
@@ -781,8 +884,12 @@ class RtspServerSession:
         lines.extend(f"{key}: {value}" for key, value in headers.items())
         payload = ("\r\n".join(lines) + "\r\n\r\n").encode("utf-8") + body
         async with self.write_lock:
-            self.writer.write(payload)
-            await self.writer.drain()
+            try:
+                await self.sock.send(payload)
+            except Exception as ex:
+                if _is_disconnect_error(ex):
+                    return
+                raise
 
 
 class RtspServer:
@@ -794,7 +901,7 @@ class RtspServer:
         self._server: Optional[asyncio.AbstractServer] = None
 
     async def start(self) -> "RtspServer":
-        self._server = await asyncio.start_server(self._handle_client, self.host, self.port)
+        self._server = await aio.start_tcp_server(self._handle_client, self.host, self.port)
         logfunc(f"RTSP server listening on {self.host}:{self.port}, dir={self.root_dir}")
         return self
 
@@ -811,10 +918,14 @@ class RtspServer:
         await self._server.wait_closed()
         self._server = None
 
-    async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        session = RtspServerSession(self, reader, writer)
+    async def _handle_client(self, sock: aio.TCPSocket) -> None:
+        session = RtspServerSession(self, sock)
         logfunc(f"{session.peername} connected")
-        await session.run()
+        try:
+            await session.run()
+        except Exception as ex:
+            if not _is_disconnect_error(ex):
+                raise
 
     def resolve_request_path(self, uri: str) -> Path:
         parsed = urllib.parse.urlsplit(uri)
@@ -842,6 +953,17 @@ class RtspServer:
             path += "/"
         return f"rtsp://{netloc}{path}"
 
+    def parse_play_count(self, uri: str) -> int:
+        parsed = urllib.parse.urlsplit(uri)
+        params = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+        value = params.get("play_count", ["0"])[0].strip()
+        if not value:
+            return 0
+        play_count = int(value)
+        if play_count < 0:
+            raise ValueError("play_count must be greater than or equal to 0")
+        return play_count
+
     def parse_interleaved_channels(self, transport: str) -> Optional[Tuple[int, int]]:
         lower = transport.lower()
         if "rtp/avp/tcp" not in lower:
@@ -857,19 +979,18 @@ class RtspServer:
     def load_media_source(self, file_path: Path) -> MediaSource:
         suffix = file_path.suffix.lower()
         if suffix == ".wav":
+            if av is None:
+                raise RtspServerError("PyAV is required for wav streaming")
             return self._load_wav_source(file_path)
         if av is None:
             raise RtspServerError("PyAV is required for mp4/mkv/aac streaming")
         return self._load_av_source(file_path)
 
     def _load_wav_source(self, file_path: Path) -> MediaSource:
-        with wave.open(str(file_path), "rb") as wav_file:
-            sample_width = wav_file.getsampwidth()
-            comp_type = wav_file.getcomptype()
-            if comp_type != "NONE":
-                raise RtspServerError(f"Unsupported WAV compression: {comp_type}")
-            if sample_width not in (1, 2, 3, 4):
-                raise RtspServerError(f"Unsupported WAV sample width: {sample_width}")
+        with av.open(str(file_path), mode="r") as container:
+            audio_stream = next((stream for stream in container.streams if stream.type == "audio"), None)
+            if audio_stream is None:
+                raise RtspServerError("No audio stream found in wav file")
         track = MediaTrackInfo(
             media_type="audio",
             control="track1",
@@ -896,12 +1017,12 @@ class RtspServer:
                 (
                     stream
                     for stream in container.streams
-                    if stream.type == "audio" and normalize_codec_name(stream.codec_context.name) in ("mpeg4-generic", "pcma", "pcmu")
+                    if stream.type == "audio" and normalize_codec_name(stream.codec_context.name) in ("mpeg4-generic", "pcma")
                 ),
                 None,
             )
             if video_stream is None and audio_stream is None:
-                raise RtspServerError("No supported H264/H265 video or AAC/G711 audio track found")
+                raise RtspServerError("No supported H264/H265 video or AAC/PCMA audio track found")
 
             if video_stream is not None:
                 codec_name = normalize_codec_name(video_stream.codec_context.name)
@@ -942,7 +1063,7 @@ class RtspServer:
 
             if audio_stream is not None:
                 codec_name = normalize_codec_name(audio_stream.codec_context.name)
-                payload_type = 104 if codec_name == "mpeg4-generic" else (8 if codec_name == "pcma" else 0)
+                payload_type = 104 if codec_name == "mpeg4-generic" else 8
                 fmtp = None
                 channels = audio_stream.codec_context.channels or 1
                 sample_rate = audio_stream.codec_context.sample_rate or 8000

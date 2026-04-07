@@ -19,9 +19,9 @@ keywords = ["asyncio", "rtsp", "rtp", "streaming", "video", "audio"]
 dependencies = ["aio-sockets"]
 
 [project.optional-dependencies]
-audio = ["numpy", "sounddevice"]
-decode = ["av"]
-playback = ["numpy", "sounddevice", "av"]
+server = ["av"]
+audio = ["numpy", "sounddevice", "av"]
+all = ["numpy", "sounddevice", "av"]
 
 [project.urls]
 Homepage = "https://github.com/yinkaisheng/aio-rtsp"
