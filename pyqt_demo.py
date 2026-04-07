@@ -11,8 +11,8 @@ import av
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 import aio_sockets as aio
-import aio_rtsp as aiortsp
-from aio_rtsp import (
+import aio_rtsp_toolkit as aiortsp
+from aio_rtsp_toolkit import (
     AudioFrameEvent,
     ClosedEvent,
     ConnectResultEvent,
@@ -22,7 +22,7 @@ from aio_rtsp import (
     VideoFrameEvent,
     open_session,
 )
-from aio_rtsp.audio_playback import SoundDeviceAudioPlayer
+from aio_rtsp_toolkit.audio_playback import SoundDeviceAudioPlayer
 from log_util import Fore, log
 
 

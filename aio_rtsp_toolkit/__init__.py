@@ -1,3 +1,5 @@
+from importlib.metadata import PackageNotFoundError, version
+
 from .tick import Tick
 from .audio_codecs import (
     decode_g711_alaw_byte,
@@ -31,6 +33,11 @@ from .client import (
 )
 from .server import RtspServer, RtspServerError, serve
 
+try:
+    __version__ = version("aio-rtsp-toolkit")
+except PackageNotFoundError:
+    __version__ = "0+unknown"
+
 __all__ = [
     'AACAudioSplicer',
     'AudioFrame',
@@ -60,6 +67,7 @@ __all__ = [
     'Tick',
     'VideoFrame',
     'VideoFrameEvent',
+    '__version__',
     'open_session',
     'serve',
 ]

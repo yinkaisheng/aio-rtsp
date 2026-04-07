@@ -129,7 +129,7 @@ class ClosedEvent(RtspEvent):
 
 
 class RtspError(Exception):
-    """Base exception for public aio-rtsp API errors."""
+    """Base exception for public aio-rtsp-toolkit API errors."""
 
     pass
 
@@ -195,7 +195,7 @@ class RTP:
 
     def __str__(self):
         return f'{self.__class__.__name__}(timestamp={self.timestamp}, payload_type={self.payload_type}, marker={self.marker}' \
-               f', seq={self.sequence_number}, payload={" ".join(f"{v:02X}" for v in self.payload[:8])}, tick={self.recv_tick})'
+               f', seq={self.sequence_number}, payload={" ".join(f"{v:02X}" for v in self.payload[:8])}.., tick={self.recv_tick})'
 
 class H264RTPNalUnitType(enum.IntEnum): # Network Abstraction Layer
     Unkown = 0

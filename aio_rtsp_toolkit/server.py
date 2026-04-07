@@ -893,7 +893,7 @@ class RtspServerSession:
 
 
 class RtspServer:
-    def __init__(self, directory: str, host: str = "0.0.0.0", port: int = 8554, session_name: str = "aio-rtsp server"):
+    def __init__(self, directory: str, host: str = "0.0.0.0", port: int = 8554, session_name: str = "aio-rtsp-toolkit server"):
         self.root_dir = Path(directory).expanduser().resolve()
         self.host = host
         self.port = port

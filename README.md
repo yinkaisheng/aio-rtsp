@@ -1,11 +1,11 @@
-# aio-rtsp
+# aio-rtsp-toolkit
 
-`aio-rtsp` is an asyncio-based RTSP toolkit for Python. It provides:
+`aio-rtsp-toolkit` is an asyncio-based RTSP toolkit for Python. It provides:
 
 - An RTSP client that exposes connection events, RTSP method timing, RTP packets, and assembled audio/video frames
 - A lightweight RTSP/TCP server that publishes local media files from a directory tree
 
-It is aimed at cases where "can play" is not enough and you also want visibility into protocol timing, packet flow, frame boundaries, and first-frame behavior.
+It is aimed at cases where "can play" is not enough and you also want visibility into protocol timing, packet flow, frame boundaries.
 
 ## Highlights
 
@@ -23,15 +23,15 @@ Timing values such as `session_elapsed`, RTSP `elapsed`, and RTP `recv_tick` are
 Base install:
 
 ```shell
-pip install aio-rtsp
+pip install aio-rtsp-toolkit
 ```
 
 Optional extras:
 
 ```shell
-pip install aio-rtsp[server]
-pip install aio-rtsp[audio]
-pip install aio-rtsp[all]
+pip install aio-rtsp-toolkit[server]
+pip install aio-rtsp-toolkit[audio]
+pip install aio-rtsp-toolkit[all]
 ```
 
 - `[server]`: installs `av` for RTSP file serving
@@ -46,21 +46,23 @@ If the RTSP stream requires authentication, include credentials in the URL, for 
 
 ```python
 import asyncio
-import aio_rtsp
+import aio_rtsp_toolkit as aiortsp
 
 
 async def main():
-    async with aio_rtsp.RtspSession("rtsp://127.0.0.1:8554/zhongli.wav", timeout=5) as session:
+    async with aiortsp.RtspSession("rtsp://127.0.0.1:8554/zhongli.wav", timeout=5) as session:
         async for event in session.iter_events():
-            if isinstance(event, aio_rtsp.ConnectResultEvent):
+            if isinstance(event, aiortsp.ConnectResultEvent):
                 print("connected:", event.local_addr, "elapsed:", event.elapsed)
-            elif isinstance(event, aio_rtsp.RtspMethodEvent):
+            elif isinstance(event, aiortsp.RtspMethodEvent):
                 print(event.method, event.status_code, event.elapsed, event.session_elapsed)
-            elif isinstance(event, aio_rtsp.VideoFrameEvent):
+            elif isinstance(event, aiortsp.RtpPacketEvent):
+                pass
+            elif isinstance(event, aiortsp.VideoFrameEvent):
                 print("video ts=", event.frame.timestamp, "size=", len(event.frame.data))
-            elif isinstance(event, aio_rtsp.AudioFrameEvent):
+            elif isinstance(event, aiortsp.AudioFrameEvent):
                 print("audio ts=", event.frame.timestamp, "samples=", event.frame.sample_count)
-            elif isinstance(event, aio_rtsp.ClosedEvent):
+            elif isinstance(event, aiortsp.ClosedEvent):
                 print("closed after", event.session_elapsed, "seconds")
 
 
@@ -78,7 +80,7 @@ python server_demo.py --dir ./media --host 0.0.0.0 --port 8554
 Each file becomes an RTSP resource under the same relative path:
 
 ```text
-rtsp://127.0.0.1:8554/eagle-h264.mp4
+rtsp://127.0.0.1:8554/morning_h264.mp4
 rtsp://127.0.0.1:8554/subdir/example.wav
 ```
 
@@ -86,11 +88,11 @@ Run the server from Python:
 
 ```python
 import asyncio
-import aio_rtsp
+import aio_rtsp_toolkit as aiortsp
 
 
 async def main():
-    await aio_rtsp.serve("./media", host="0.0.0.0", port=8554)
+    await aiortsp.serve("./media", host="0.0.0.0", port=8554)
 
 
 asyncio.run(main())
@@ -107,21 +109,14 @@ Current server behavior:
 
 ### Supported Inputs
 
-Accepted file extensions:
-
-- `.mp4`
-- `.mkv`
-- `.wav`
-- `.aac`
+Accepted file extensions: `.mp4`, `.mkv`, `.wav` and `.aac`.
 
 Supported media handling:
 
 - Video: H.264 and H.265
 - AAC audio: served as `mpeg4-generic`
-- WAV audio: WAV input is decoded, resampled with PyAV, and served as `PCMA/8000/1`
+- WAV audio: PCM WAV input is resampled with PyAV and served as `PCMA/8000/1`
 - `PCMU` is not advertised by the current server implementation
-
-For `.mp4`, `.mkv`, `.aac`, and `.wav`, the server requires PyAV.
 
 ### Loop Control
 
@@ -156,20 +151,20 @@ import asyncio
 import fractions
 
 import av
-import aio_rtsp
+import aio_rtsp_toolkit as aiortsp
 
 
 async def main():
     codec = None
     time_base = fractions.Fraction(1, 90000)
 
-    async with aio_rtsp.RtspSession("rtsp://127.0.0.1:8554/morning_h264.mp4", timeout=5) as session:
+    async with aiortsp.RtspSession("rtsp://127.0.0.1:8554/morning_h264.mp4", timeout=5) as session:
         async for event in session.iter_events():
-            if isinstance(event, aio_rtsp.RtspMethodEvent) and event.method == "DESCRIBE":
+            if isinstance(event, aiortsp.RtspMethodEvent) and event.method == "DESCRIBE":
                 video_sdp = event.response.sdp.get("video", {})
                 codec_name = video_sdp.get("codec_name", "").lower()
                 if codec_name:
-                    av_codec_name = aio_rtsp.HEVCCodecName if codec_name == aio_rtsp.H265CodecName else codec_name
+                    av_codec_name = aiortsp.HEVCCodecName if codec_name == aiortsp.H265CodecName else codec_name
                     codec = av.CodecContext.create(av_codec_name, "r")
                     time_base = fractions.Fraction(1, video_sdp.get("clock_rate", 90000))
                     for key in ("sps", "pps"):
@@ -177,7 +172,7 @@ async def main():
                         if extra:
                             codec.parse(extra)
 
-            elif isinstance(event, aio_rtsp.VideoFrameEvent) and codec is not None:
+            elif isinstance(event, aiortsp.VideoFrameEvent) and codec is not None:
                 for packet in codec.parse(event.frame.data):
                     packet.pts = packet.dts = event.frame.timestamp
                     packet.time_base = time_base
@@ -190,7 +185,7 @@ asyncio.run(main())
 
 ### Optional Audio Playback Helpers
 
-`aio_rtsp.audio_playback.SoundDeviceAudioPlayer` can decode and play audio frames.
+`aio_rtsp_toolkit.audio_playback.SoundDeviceAudioPlayer` can decode and play audio frames.
 
 - Install the `[audio]` extra for `numpy`, `sounddevice`, and `av`
 - G.711 A-law and mu-law playback do not require PyAV
@@ -214,7 +209,7 @@ python pyqt_demo.py
 
 `cli_demo.py` logs RTSP timing, writes raw video to disk, and decodes frames with PyAV.
 
-Install the `[all]` extra for PyAV, then add `Pillow` if you want to save the first decoded frame as an image.
+Install the `[all]` extra for PyAV, then install `Pillow` if you want to save the first decoded frame as an image.
 
 ```shell
 python cli_demo.py -u rtsp://127.0.0.1:8554/morning_h264.mp4

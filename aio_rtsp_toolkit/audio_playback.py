@@ -1,4 +1,4 @@
-"""Optional audio playback helpers for aio-rtsp.
+"""Optional audio playback helpers for aio-rtsp-toolkit.
 
 This module is intentionally separate from the RTSP protocol core. It depends
 on optional runtime packages for playback and, for some codecs, decoding.
@@ -21,7 +21,7 @@ if TYPE_CHECKING:
 def _missing_dependency_error(feature: str, package_name: str, extra_name: str) -> RuntimeError:
     return RuntimeError(
         f"{feature} requires the optional dependency '{package_name}'. "
-        f"Install it with: pip install aio-rtsp[{extra_name}]"
+        f"Install it with: pip install aio-rtsp-toolkit[{extra_name}]"
     )
 
 
@@ -309,4 +309,3 @@ class SoundDeviceAudioPlayer:
             self.output_stream = None
             self.output_sample_rate = 0
             self.output_channels = 0
-

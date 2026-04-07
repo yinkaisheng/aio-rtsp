@@ -6,9 +6,10 @@ import threading
 from typing import Tuple, List, AsyncGenerator, Any
 
 import aio_sockets as aio
-import aio_rtsp as aiortsp
-from aio_rtsp import AudioFrameEvent, ClosedEvent, ConnectResultEvent, RtspMethodEvent, Tick, VideoFrameEvent, open_session
-from aio_rtsp.audio_playback import SoundDeviceAudioPlayer
+import aio_rtsp_toolkit as aiortsp
+from aio_rtsp_toolkit import (AudioFrameEvent, ClosedEvent, ConnectResultEvent, RtpPacketEvent, RtspMethodEvent,
+                              Tick, VideoFrameEvent, open_session)
+from aio_rtsp_toolkit.audio_playback import SoundDeviceAudioPlayer
 from log_util import Fore, log
 
 
@@ -93,6 +94,8 @@ def pyav_play(rtsp_url: str, forward_address: aio.IPAddress, play_time: int, tim
                         audio_sdp = event.response.sdp.get('audio', None)
                         if audio_sdp:
                             audio_player.configure(audio_sdp)
+            elif isinstance(event, RtpPacketEvent):
+                log(f'{Tick.process_tick()} {Fore.Green}{event.media_channel} {event.rtp}{Fore.Reset}')
             elif isinstance(event, VideoFrameEvent):
                 vframe = event.frame
                 if fout:
@@ -229,8 +232,8 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('-u', '--url', help='rtsp url')
     parser.add_argument('-f', '--forward', default='', help='forward address')
-    parser.add_argument('-t', '--time', type=int, default=10, help='play time')
-    parser.add_argument('-to', '--timeout', type=int, default=10, help='timeout')
+    parser.add_argument('-t', '--time', type=int, default=5, help='play time')
+    parser.add_argument('-to', '--timeout', type=int, default=5, help='timeout')
 
     args = parser.parse_args()
     if args.url is None:

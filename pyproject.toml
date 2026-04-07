@@ -3,9 +3,9 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "aio_rtsp"
+name = "aio-rtsp-toolkit"
 version = "0.1.0"
-description = "Async RTSP client with protocol timing, RTP packet events, and audio/video frame callbacks"
+description = "Async RTSP client with protocol timing, RTP and frame events, plus a lightweight RTSP/TCP file server"
 readme = "README.md"
 authors = [{name = "yinkaisheng", email = "yinkaisheng@foxmail.com"}]
 license = {text = "Apache-2.0"}
@@ -28,4 +28,4 @@ Homepage = "https://github.com/yinkaisheng/aio-rtsp"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["aio_rtsp"]
+include = ["aio_rtsp_toolkit"]
