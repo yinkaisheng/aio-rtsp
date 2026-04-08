@@ -217,7 +217,7 @@ python cli_demo.py -u rtsp://127.0.0.1:8554/morning_h264.mp4
 
 ## API Summary
 
-### `RtspSession(rtsp_url, forward_address=None, timeout=4, log_type=RtspClientMsgType.RTSP, enable_video=True, enable_audio=True)`
+### `RtspSession(rtsp_url, forward_address=None, timeout=4, session_id=None, enable_video=True, enable_audio=True, log_type=RtspClientMsgType.RTSP, log_prefix='')`
 
 High-level reusable RTSP session object. Use it with `async with` and consume events through `iter_events()`.
 
@@ -227,7 +227,7 @@ High-level reusable RTSP session object. Use it with `async with` and consume ev
 
 Starts the session, yields typed events, and closes the socket when iteration ends or fails.
 
-### `open_session(rtsp_url, forward_address=None, timeout=4, log_type=RtspClientMsgType.RTSP, enable_video=True, enable_audio=True) -> RtspSession`
+### `open_session(rtsp_url, forward_address=None, timeout=4, session_id=None, enable_video=True, enable_audio=True, log_type=RtspClientMsgType.RTSP, log_prefix='') -> RtspSession`
 
 Convenience helper that returns a `RtspSession`.
 

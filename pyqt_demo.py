@@ -23,11 +23,11 @@ from aio_rtsp_toolkit import (
     open_session,
 )
 from aio_rtsp_toolkit.audio_playback import SoundDeviceAudioPlayer
-from log_util import Fore, log
+from log_util import Fore, log, logger, config_logger
 
 
-aio.aio_sockets.logfunc = log
-aiortsp.client.logfunc = log
+aio.aio_sockets.logfunc = logger.info
+aiortsp.client.logfunc = logger.info
 
 
 class VideoLabel(QtWidgets.QLabel):
@@ -122,12 +122,12 @@ class RtspPlayerThread(QtCore.QThread):
                     if event.exception is None:
                         self.log_ready.emit(
                             f"{Tick.process_tick()} RTSP connected, local addr={event.local_addr}, cost={event.elapsed}s"
-                            f", session elapsed={event.session_elapsed}s"
+                            f", session_elapsed={event.session_elapsed}s"
                         )
                     else:
                         self.log_ready.emit(
                             f"{Tick.process_tick()} RTSP connect failed, local addr={event.local_addr}, cost={event.elapsed}s"
-                            f", session elapsed={event.session_elapsed}s"
+                            f", session_elapsed={event.session_elapsed}s"
                             f", ex={event.exception!r}"
                         )
                     if event.local_addr is None:
@@ -235,7 +235,7 @@ class RtspPlayerThread(QtCore.QThread):
                     audio_player.feed(aframe)
 
                 elif isinstance(event, ClosedEvent):
-                    self.log_ready.emit(f"{Tick.process_tick()} rtsp closed, session elapsed={event.session_elapsed}s")
+                    self.log_ready.emit(f"{Tick.process_tick()} rtsp closed, session_elapsed={event.session_elapsed}s")
                     self.clear_video.emit()
                     break
 
@@ -265,9 +265,9 @@ class RtspPlayerThread(QtCore.QThread):
         async with open_session(
             self.rtsp_url,
             timeout=self.timeout,
-            log_type=aiortsp.RtspClientMsgType.ConnectResult | aiortsp.RtspClientMsgType.RTSP,
             enable_video=self.enable_video,
             enable_audio=self.enable_audio,
+            log_type=aiortsp.DEFAULT_LOG_TYPE,
         ) as session:
             async for event in session.iter_events(self.stop_event):
                 if isinstance(event, RtpPacketEvent):
@@ -277,7 +277,7 @@ class RtspPlayerThread(QtCore.QThread):
     def _log_rtsp(self, event: RtspMethodEvent) -> None:
         self.log_ready.emit(
             f"{Tick.process_tick()} RTSP {event.method} status={event.status_code}"
-            f", cost={event.elapsed}s, session elapsed={event.session_elapsed}s"
+            f", cost={event.elapsed}s, session_elapsed={event.session_elapsed}s"
         )
 
 
@@ -478,6 +478,7 @@ class MainWindow(QtWidgets.QWidget):
 
 
 def main() -> int:
+    config_logger(logger, 'info', log_dir='logs', log_file='pyqt_demo.log')
     app = QtWidgets.QApplication(sys.argv)
     window = MainWindow()
     window.show()

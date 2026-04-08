@@ -4,6 +4,7 @@
 import os
 import sys
 import time
+import itertools
 from dataclasses import dataclass
 from typing import (Any, AsyncGenerator, Callable, Deque, Dict, Generator, List, Iterable, Iterator, Optional, Sequence, Set, Tuple, Union)
 import enum
@@ -12,6 +13,7 @@ import struct
 import hashlib
 import asyncio
 import threading
+import traceback
 import urllib.parse
 
 import aio_sockets as aio
@@ -19,20 +21,23 @@ from .tick import Tick
 
 
 logfunc = print
+_session_id_counter = itertools.count(1)
 
 StopEventLike = Union[threading.Event, asyncio.Event]
 
 
 class RtspClientMsgType:
     """Bit flags used to classify emitted data and control debug logging."""
+    Exception = 1
+    ConnectResult = 2
+    Closed = 4
+    RTSP = 8
+    VideoFrame = 16
+    AudioFrame = 32
+    RTP = 64
 
-    ConnectResult = 1
-    RTSP = 2
-    RTP = 4
-    VideoFrame = 8
-    AudioFrame = 16
-    Closed = 32
-    Exception = 64
+
+DEFAULT_LOG_TYPE = RtspClientMsgType.Exception | RtspClientMsgType.ConnectResult | RtspClientMsgType.Closed | RtspClientMsgType.RTSP
 
 
 @dataclass(frozen=True)
@@ -91,7 +96,7 @@ class RtpPacketEvent(RtspEvent):
     """Event emitted for each parsed interleaved RTP packet."""
 
     channel: int = -1
-    media_channel: str = ''
+    media_channel: str = '' # 'audio_rtp', 'audio_rtcp', 'video_rtp', 'video_rtcp'
     rtp: Optional['RTP'] = None
 
 
@@ -131,7 +136,9 @@ class ClosedEvent(RtspEvent):
 class RtspError(Exception):
     """Base exception for public aio-rtsp-toolkit API errors."""
 
-    pass
+    def __init__(self, message: str, *, session_elapsed: Optional[float] = None):
+        super().__init__(message)
+        self.session_elapsed = session_elapsed
 
 
 class RtspConnectionError(RtspError):
@@ -155,13 +162,14 @@ class RtspProtocolError(RtspError):
 class RtspResponseError(RtspError):
     """Raised when an RTSP method returns a non-success response."""
 
-    def __init__(self, method: str, status_code: int, response: 'RtspResponse', media_type: Optional[str] = None):
+    def __init__(self, method: str, status_code: int, response: 'RtspResponse',
+                 media_type: Optional[str] = None, *, session_elapsed: Optional[float] = None):
         self.method = method
         self.status_code = status_code
         self.response = response
         self.media_type = media_type
         target = method if media_type is None else f'{method} {media_type}'
-        super().__init__(f'RTSP {target} failed with status {status_code}')
+        super().__init__(f'RTSP {target} failed with status {status_code}', session_elapsed=session_elapsed)
 
 
 class RTP:
@@ -189,13 +197,12 @@ class RTP:
         self.ssrc = ssrc
         #: RTP payload bytes after header and padding removal.
         self.payload: bytes = payload
-        #: Process-local receive time relative to process startup, derived from
-        #: ``time.perf_counter()``.
+        #: Process-local receive time relative to process startup, from ``Tick.process_tick()``.
         self.recv_tick = 0
 
     def __str__(self):
         return f'{self.__class__.__name__}(timestamp={self.timestamp}, payload_type={self.payload_type}, marker={self.marker}' \
-               f', seq={self.sequence_number}, payload={" ".join(f"{v:02X}" for v in self.payload[:8])}.., tick={self.recv_tick})'
+               f', seq={self.sequence_number}, payload={" ".join(f"{v:02X}" for v in self.payload[:8])}.., recv_tick={self.recv_tick})'
 
 class H264RTPNalUnitType(enum.IntEnum): # Network Abstraction Layer
     Unkown = 0
@@ -376,12 +383,14 @@ class AudioSplicer:
     """Base class for converting RTP payloads into audio frame objects."""
 
     def __init__(self, codec_name_lower: str, clock_rate: int = 0, channels: int = 1,
-                 fmtp: Dict[str, Any] = None, log_type: int = 0):
+                 fmtp: Dict[str, Any] = None, log_type: int = 0,
+                 log_tag: str = ''):
         self.codec_name_lower = codec_name_lower
         self.clock_rate = clock_rate
         self.channels = channels or 1
         self.fmtp = fmtp or {}
         self.log_type = log_type
+        self.log_tag = log_tag
 
     def new_audio_frame(self, rtp: RTP, data: bytes, timestamp: int = None, sample_count: int = 0) -> AudioFrame:
         seq = SeqNo(rtp.sequence_number, rtp.recv_tick)
@@ -411,8 +420,9 @@ class AACAudioSplicer(AudioSplicer):
     """Splicer for MPEG4-GENERIC AAC RTP payloads."""
 
     def __init__(self, codec_name_lower: str, clock_rate: int = 0, channels: int = 1,
-                 fmtp: Dict[str, Any] = None, log_type: int = 0):
-        super().__init__(codec_name_lower, clock_rate, channels, fmtp, log_type)
+                 fmtp: Dict[str, Any] = None, log_type: int = 0,
+                 log_tag: str = ''):
+        super().__init__(codec_name_lower, clock_rate, channels, fmtp, log_type, log_tag)
         self.size_length = int(self.fmtp.get('sizelength', 13) or 13)
         self.index_length = int(self.fmtp.get('indexlength', 3) or 0)
         self.index_delta_length = int(self.fmtp.get('indexdeltalength', 3) or 0)
@@ -472,7 +482,8 @@ class AACAudioSplicer(AudioSplicer):
         return frames
 
 
-def create_audio_splicer(audio_sdp: Dict[str, Any], log_type: int = 0) -> Union[AudioSplicer, None]:
+def create_audio_splicer(audio_sdp: Dict[str, Any], log_type: int = 0,
+                         log_tag: str = '') -> Union[AudioSplicer, None]:
     """Create an audio splicer from parsed audio SDP information."""
 
     if not audio_sdp:
@@ -482,14 +493,14 @@ def create_audio_splicer(audio_sdp: Dict[str, Any], log_type: int = 0) -> Union[
     channels = int(audio_sdp.get('channel', 1) or 1)
     fmtp = audio_sdp.get('fmtp', None)
     if codec_name_lower in ('pcma', 'g711a', 'g711-alaw'):
-        return RawAudioSplicer('pcma', clock_rate or 8000, channels, fmtp, log_type)
+        return RawAudioSplicer('pcma', clock_rate or 8000, channels, fmtp, log_type, log_tag)
     if codec_name_lower in ('pcmu', 'g711u', 'g711-mulaw'):
-        return RawAudioSplicer('pcmu', clock_rate or 8000, channels, fmtp, log_type)
+        return RawAudioSplicer('pcmu', clock_rate or 8000, channels, fmtp, log_type, log_tag)
     if codec_name_lower in ('mpeg4-generic', 'aac'):
-        return AACAudioSplicer('mpeg4-generic', clock_rate, channels, fmtp, log_type)
+        return AACAudioSplicer('mpeg4-generic', clock_rate, channels, fmtp, log_type, log_tag)
     if codec_name_lower in ('mp4a-latm', 'mpeg4-latm', 'aac_latm'):
-        return RawAudioSplicer('mp4a-latm', clock_rate, channels, fmtp, log_type)
-    return RawAudioSplicer(codec_name_lower, clock_rate, channels, fmtp, log_type)
+        return RawAudioSplicer('mp4a-latm', clock_rate, channels, fmtp, log_type, log_tag)
+    return RawAudioSplicer(codec_name_lower, clock_rate, channels, fmtp, log_type, log_tag)
 
 
 def ensure_start_code(nalu: bytes) -> bytes:
@@ -526,12 +537,13 @@ class RtspResponse:
 class VideoSplicer:
     """Base class for reconstructing video frames from RTP packets."""
 
-    def __init__(self, log_type: int = 0):
+    def __init__(self, log_type: int = 0, log_tag: str = ''):
         self.codec_name_lower = ''
         self._cur_frame_timestamp = None
         self._last_frame_end_seqno = None
         self.rtp_list: List[RTP] = []
         self.log_type = log_type
+        self.log_tag = log_tag
 
     def try_get_video_frame(self, rtp: RTP) -> Union[List[VideoFrame], None]:
         return None
@@ -627,8 +639,8 @@ class VideoSplicer:
 class H264Splicer(VideoSplicer):
     """H.264 RTP payload splicer based on RFC 6184."""
 
-    def __init__(self, log_type: int = 0):
-        super().__init__(log_type)
+    def __init__(self, log_type: int = 0, log_tag: str = ''):
+        super().__init__(log_type, log_tag)
         self.codec_name_lower = H264CodecName
 
     def try_get_video_frame(self, rtp: RTP) -> Union[List[VideoFrame], None]:
@@ -682,7 +694,7 @@ class H264Splicer(VideoSplicer):
             end_bit = fu_header >> 6 & 0b0001
             original_nal = fu_header & 0b0001_1111 # 1: frame P, 5: frame I
             if self.log_type & RtspClientMsgType.RTP:
-                logfunc(f'  video payload forbidden_bit={forbidden_bit}, nri={nri_type}, nal={nalu_type}, payload[1] fu_header start_bit={start_bit}, end_bit={end_bit}, org_nal={original_nal}')
+                logfunc(f'{self.log_tag} video payload forbidden_bit={forbidden_bit}, nri={nri_type}, nal={nalu_type}, payload[1] fu_header start_bit={start_bit}, end_bit={end_bit}, org_nal={original_nal}')
             self.handle_rtp_fu(end_bit, rtp, frames)
         elif nalu_type == H264RTPNalUnitType.FUB.value: # 29
             #  0                   1                   2                   3
@@ -699,7 +711,7 @@ class H264Splicer(VideoSplicer):
             pass # not implemented
         else:
             if self.log_type & RtspClientMsgType.RTP:
-                logfunc(f'  rtp payload[0] fu_indicator forbidden_bit={forbidden_bit}, nri={nri_type}, nal={nalu_type}')
+                logfunc(f'{self.log_tag} rtp payload[0] fu_indicator forbidden_bit={forbidden_bit}, nri={nri_type}, nal={nalu_type}')
             self.handle_rtp_not_fu(rtp, frames)
             seq_no = SeqNo(rtp.sequence_number, rtp.recv_tick)
             frame = VideoFrame(self.codec_name_lower, nalu_type, rtp.timestamp, bytearray(START_BYTES), seq_no, seq_no)
@@ -724,8 +736,8 @@ class H264Splicer(VideoSplicer):
 class H265Splicer(VideoSplicer):
     """H.265/HEVC RTP payload splicer based on RFC 7798."""
 
-    def __init__(self, log_type: int = 0):
-        super().__init__(log_type)
+    def __init__(self, log_type: int = 0, log_tag: str = ''):
+        super().__init__(log_type, log_tag)
         self.codec_name_lower = H265CodecName
         self.has_donl_field = False
 
@@ -763,11 +775,11 @@ class H265Splicer(VideoSplicer):
             end_bit = fu_header >> 6 & 0b0001
             original_nalu = fu_header & 0b0011_1111 # [16,40] I frame, other P frame
             if self.log_type & RtspClientMsgType.RTP:
-                logfunc(f'  video payload forbidden_bit={forbidden_bit}, nal={nal_uint_type}, layer_id={layer_id}, tid={tid}, fu_header start_bit={start_bit}, end_bit={end_bit}, org_nal={original_nalu}')
+                logfunc(f'{self.log_tag} video payload forbidden_bit={forbidden_bit}, nal={nal_uint_type}, layer_id={layer_id}, tid={tid}, fu_header start_bit={start_bit}, end_bit={end_bit}, org_nal={original_nalu}')
             self.handle_rtp_fu(end_bit, rtp, frames)
         else:
             if self.log_type & RtspClientMsgType.RTP:
-                logfunc(f'  video payload forbidden_bit={forbidden_bit}, nal={nal_uint_type}, layer_id={layer_id}, tid={tid}')
+                logfunc(f'{self.log_tag} video payload forbidden_bit={forbidden_bit}, nal={nal_uint_type}, layer_id={layer_id}, tid={tid}')
             self.handle_rtp_not_fu(rtp, frames)
             if nal_uint_type == H265RTPNalUnitType.AP.value: # 48
                 # 0                   1                   2                   3
@@ -792,7 +804,7 @@ class H265Splicer(VideoSplicer):
                 # |                               :...OPTIONAL RTP padding        |
                 # +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
                 if self.log_type & RtspClientMsgType.RTP:
-                    logfunc(f'  video payload forbidden_bit={forbidden_bit}, nal={nal_uint_type}, layer_id={layer_id}, tid={tid}')
+                    logfunc(f'{self.log_tag} video payload forbidden_bit={forbidden_bit}, nal={nal_uint_type}, layer_id={layer_id}, tid={tid}')
                 index = 2 # playload header size
                 payload_size = len(rtp.payload)
                 if self.has_donl_field:
@@ -803,7 +815,7 @@ class H265Splicer(VideoSplicer):
                     nalu_header = rtp.payload[index:index+2]
                     original_nal_uint_type = nalu_header[0] >> 1 & 0b0011_1111
                     if self.log_type & RtspClientMsgType.RTP:
-                        logfunc(f'    AP nal={original_nal_uint_type}')
+                        logfunc(f'{self.log_tag} AP nal={original_nal_uint_type}')
                     seq_no = SeqNo(rtp.sequence_number, rtp.recv_tick)
                     frame = VideoFrame(self.codec_name_lower, original_nal_uint_type, rtp.timestamp, bytearray(START_BYTES), seq_no, seq_no)
                     frame.data.extend(rtp.payload[index:index+nalu_size])
@@ -847,7 +859,9 @@ class RtspClient:
     lower-level helper directly.
     """
 
-    def __init__(self, url: str, forward_address: aio.IPAddress = None, total_time: int = 10):
+    def __init__(self, url: str, forward_address: aio.IPAddress = None, timeout: float = 4,
+                 log_type: int = DEFAULT_LOG_TYPE,
+                 log_tag: str = ''):
         #: Value sent in RTSP request headers.
         self.user_agent = 'python aio rtsp client'
         parse_result = urllib.parse.urlparse(url)
@@ -885,13 +899,13 @@ class RtspClient:
             self.audio_rtp_channel: 'audio_rtp',
             self.audio_rtcp_channel: 'audio_rtcp',
         }
-        self.timeout: float = 4
-        self.total_time = total_time
+        self.timeout = timeout
+        self.log_type = log_type
+        self.log_tag = log_tag
+        self.tick = Tick()
         #: Receive buffer used for RTSP headers, RTSP bodies, and interleaved RTP packets.
         self.recv_buffer = bytearray()
         self.recv_buf_start = 0
-        self.log_type = RtspClientMsgType.ConnectResult|RtspClientMsgType.RTSP
-        self.tick = Tick()
         self.video_splicer: VideoSplicer = None
         self.audio_splicer: AudioSplicer = None
         self.rtps_before_play_response: List[Tuple[int, RTP]] = []
@@ -900,13 +914,13 @@ class RtspClient:
         """Open the RTSP TCP connection."""
 
         if self.log_type & RtspClientMsgType.ConnectResult:
-            logfunc(f'connect {self.host}:{self.port}')
+            logfunc(f'{self.log_tag} connect {self.host}:{self.port}')
         self.tick.reset()
 
         self.sock = await asyncio.wait_for(aio.open_tcp_connection(self.host, self.port), timeout=self.timeout)
         self.local_addr = self.sock.getsockname()
         if self.log_type & RtspClientMsgType.ConnectResult:
-            logfunc(f'connected local_addr={self.local_addr}')
+            logfunc(f'{self.log_tag} connected local_addr={self.local_addr}')
 
     def check_auth(self, rtsp_resp: RtspResponse):
         """Parse a 401 authentication challenge from an RTSP response."""
@@ -964,13 +978,13 @@ class RtspClient:
             f'CSeq: {self.cseq}\r\n' \
             f'User-Agent: {self.user_agent}{auth_header}\r\n\r\n'
         if self.log_type & RtspClientMsgType.RTSP:
-            logfunc(content)
+            logfunc(f'{self.log_tag} {content}')
         self.tick.update()
         await self.sock.send(content.encode('utf-8'))
         rtsp_resp = await self.wait_rstp_respone(timeout=self.timeout)
         rtsp_resp.elapsed = self.tick.since_last()
         if self.log_type & RtspClientMsgType.RTSP:
-            logfunc(f'{self.local_addr} recv:\nstatus code: {rtsp_resp.status_code}'
+            logfunc(f'{self.log_tag} {self.local_addr} recv:\nstatus code: {rtsp_resp.status_code}'
                 f'\nheaders: {rtsp_resp.headers}'
                 f'\nbody: {rtsp_resp.body}')
         return rtsp_resp
@@ -985,13 +999,13 @@ class RtspClient:
             f'User-Agent: {self.user_agent}\r\n'    \
             f'Accept: application/sdp{auth_header}\r\n\r\n'
         if self.log_type & RtspClientMsgType.RTSP:
-            logfunc(content)
+            logfunc(f'{self.log_tag} {content}')
         self.tick.update()
         await self.sock.send(content.encode('utf-8'))
         rtsp_resp = await self.wait_rstp_respone(timeout=self.timeout)
         rtsp_resp.elapsed = self.tick.since_last()
         if self.log_type & RtspClientMsgType.RTSP:
-            logfunc(f'{self.local_addr} recv:\nstatus code: {rtsp_resp.status_code}'
+            logfunc(f'{self.log_tag} recv:\nstatus code: {rtsp_resp.status_code}'
                 f'\nheaders: {rtsp_resp.headers}'
                 f'\nbody: {rtsp_resp.body}')
         if rtsp_resp.status_code != 200:
@@ -1045,9 +1059,9 @@ a=control:track3
                 if len(parts) == 3:
                     media_info['channel'] = int(parts[2])
                 if media_info['codec_name'] == 'H264':
-                    self.video_splicer = H264Splicer(self.log_type)
+                    self.video_splicer = H264Splicer(self.log_type, log_tag=self.log_tag)
                 elif media_info['codec_name'] == 'H265':
-                    self.video_splicer = H265Splicer(self.log_type)
+                    self.video_splicer = H265Splicer(self.log_type, log_tag=self.log_tag)
             elif line.startswith('a=fmtp:'): # format parameters
                 fmtp = {}
                 for it in line[line.find(' '):].split(';'):
@@ -1086,9 +1100,9 @@ a=control:track3
                 audio_sdp['codec_name'] = 'PCMU'
                 audio_sdp['clock_rate'] = 8000
                 audio_sdp['channel'] = 1
-        self.audio_splicer = create_audio_splicer(audio_sdp, self.log_type)
+        self.audio_splicer = create_audio_splicer(audio_sdp, self.log_type, log_tag=self.log_tag)
         if self.log_type & RtspClientMsgType.RTSP:
-            logfunc(f'sdp:\n{self.sdp}')
+            logfunc(f'{self.log_tag} sdp:\n{self.sdp}')
         rtsp_resp.sdp = self.sdp
         return rtsp_resp
 
@@ -1104,14 +1118,14 @@ a=control:track3
                 f'User-Agent: {self.user_agent}{auth_header}\r\n' \
                 f'Transport: {video_sdp["transport"]}/TCP;unicast;interleaved={self.video_rtp_channel}-{self.video_rtcp_channel}\r\n\r\n'
             if self.log_type & RtspClientMsgType.RTSP:
-                logfunc(content)
+                logfunc(f'{self.log_tag} {content}')
             self.tick.update()
             await self.sock.send(content.encode('utf-8'))
             rtsp_resp = await self.wait_rstp_respone(timeout=self.timeout)
             rtsp_resp.elapsed = self.tick.since_last()
             rtsp_rtsps['video'] = rtsp_resp
             if self.log_type & RtspClientMsgType.RTSP:
-                logfunc(f'{self.local_addr} recv:\nstatus code: {rtsp_resp.status_code}'
+                logfunc(f'{self.log_tag} recv:\nstatus code: {rtsp_resp.status_code}'
                     f'\nheaders: {rtsp_resp.headers}'
                     f'\nbody: {rtsp_resp.body}')
             self.session = rtsp_resp.headers.get('Session', self.session).split(';')[0]
@@ -1125,14 +1139,14 @@ a=control:track3
                 f'Session: {self.session}{auth_header}\r\n\r\n'
 
             if self.log_type & RtspClientMsgType.RTSP:
-                logfunc(content)
+                logfunc(f'{self.log_tag} {content}')
             self.tick.update()
             await self.sock.send(content.encode('utf-8'))
             rtsp_resp = await self.wait_rstp_respone(timeout=self.timeout)
             rtsp_resp.elapsed = self.tick.since_last()
             rtsp_rtsps['audio'] = rtsp_resp
             if self.log_type & RtspClientMsgType.RTSP:
-                logfunc(f'{self.local_addr} recv:\nstatus code: {rtsp_resp.status_code}'
+                logfunc(f'{self.log_tag} recv:\nstatus code: {rtsp_resp.status_code}'
                     f'\nheaders: {rtsp_resp.headers}'
                     f'\nbody: {rtsp_resp.body}')
             self.session = rtsp_resp.headers.get('Session', self.session).split(';')[0]
@@ -1147,7 +1161,7 @@ a=control:track3
             f'Session: {self.session}\r\n'  \
             f'Range: npt=0.000-{auth_header}\r\n\r\n'
         if self.log_type & RtspClientMsgType.RTSP:
-            logfunc(content)
+            logfunc(f'{self.log_tag} {content}')
         self.tick.update()
         await self.sock.send(content.encode('utf-8'))
 
@@ -1167,7 +1181,7 @@ a=control:track3
         rtsp_resp = await self.wait_rstp_respone(timeout=self.timeout)
         rtsp_resp.elapsed = self.tick.since_last()
         if self.log_type & RtspClientMsgType.RTSP:
-            logfunc(f'{self.local_addr} recv:\nstatus code: {rtsp_resp.status_code}'
+            logfunc(f'{self.log_tag} recv:\nstatus code: {rtsp_resp.status_code}'
                 f'\nheaders: {rtsp_resp.headers}'
                 f'\nbody: {rtsp_resp.body}')
         return rtsp_resp
@@ -1185,7 +1199,7 @@ a=control:track3
             f'User-Agent: {self.user_agent}\r\n'    \
             f'Session: {self.session}{auth_header}\r\n\r\n'
         if self.log_type & RtspClientMsgType.RTSP:
-            logfunc(content)
+            logfunc(f'{self.log_tag} {content}')
         self.tick.update()
         await self.sock.send(content.encode('utf-8'))
         # handle recv rtp
@@ -1197,7 +1211,7 @@ a=control:track3
         rtsp_resp = await self.wait_rstp_respone(timeout=timeout)
         rtsp_resp.elapsed = self.tick.since_last()
         if self.log_type & RtspClientMsgType.RTSP:
-            logfunc(f'{self.local_addr} recv:\nstatus code: {rtsp_resp.status_code}'
+            logfunc(f'{self.log_tag} recv:\nstatus code: {rtsp_resp.status_code}'
                 f'\nheaders: {rtsp_resp.headers}'
                 f'\nbody: {rtsp_resp.body}')
         return rtsp_resp
@@ -1213,7 +1227,12 @@ a=control:track3
             if status_code is None:
                 left_time = timeout - (time.perf_counter() - tick)
                 if left_time <= 0:
-                    raise RtspTimeoutError('RTSP receive timeout while waiting for RTSP response')
+                    if self.log_type & RtspClientMsgType.Exception:
+                        logfunc(f'{self.log_tag} rtsp receive timeout while waiting for RTSP response')
+                    raise RtspTimeoutError(
+                        'RTSP receive timeout while waiting for RTSP response',
+                        session_elapsed=self.tick.since_start()
+                    )
                 await self.recv_some_to_buffer(timeout=left_time)
             else:
                 rtsp_resp = RtspResponse(status_code, headers)
@@ -1223,7 +1242,12 @@ a=control:track3
                     if recv_len < content_len:
                         left_time = timeout - (time.perf_counter() - tick)
                         if left_time <= 0:
-                            raise RtspTimeoutError('RTSP receive timeout while waiting for RTSP response')
+                            if self.log_type & RtspClientMsgType.Exception:
+                                logfunc(f'{self.log_tag} rtsp receive timeout while waiting for RTSP response body')
+                            raise RtspTimeoutError(
+                                'RTSP receive timeout while waiting for RTSP response',
+                                session_elapsed=self.tick.since_start(),
+                            )
                         await self.recv_exactly_to_buffer(content_len-recv_len, timeout=left_time)
                     rtsp_resp.body = self.recv_buffer[self.recv_buf_start:self.recv_buf_start + content_len].decode('utf-8')
                     self.recv_buf_start = self.recv_buf_start + content_len
@@ -1266,12 +1290,18 @@ a=control:track3
                 recv_data = await asyncio.wait_for(self.sock.recv(), timeout=timeout)
             except (TimeoutError, asyncio.TimeoutError) as ex:
                 if self.log_type & RtspClientMsgType.Exception:
-                    logfunc(f'recv timeout exception: {ex!r}')
-                raise RtspTimeoutError('RTSP receive timeout while waiting for RTP data') from ex
+                    logfunc(f'{self.log_tag} recv timeout exception: {ex!r}')
+                raise RtspTimeoutError(
+                    'RTSP receive timeout while waiting for RTP data',
+                    session_elapsed=self.tick.since_start(),
+                ) from ex
             if not recv_data:
                 if self.log_type & RtspClientMsgType.Exception:
-                    logfunc('rtsp connection closed by peer')
-                raise RtspConnectionError('RTSP connection closed by peer while waiting for RTP data')
+                    logfunc(f'{self.log_tag} rtsp connection closed by peer')
+                raise RtspConnectionError(
+                    'RTSP connection closed by peer while waiting for RTP data',
+                    session_elapsed=self.tick.since_start(),
+                )
             self.recv_buffer.extend(recv_data)
 
     async def recv_exactly_to_buffer(self, n, timeout: float = 4) -> None:
@@ -1279,12 +1309,18 @@ a=control:track3
             recv_data = await asyncio.wait_for(self.sock.recv_exactly(n), timeout=timeout)
         except (TimeoutError, asyncio.TimeoutError) as ex:
             if self.log_type & RtspClientMsgType.Exception:
-                logfunc(f'recv timeout exception: {ex!r}')
-            raise RtspTimeoutError('RTSP receive timeout while waiting for RTP data') from ex
+                logfunc(f'{self.log_tag} recv timeout exception: {ex!r}')
+            raise RtspTimeoutError(
+                'RTSP receive timeout while waiting for RTP data',
+                session_elapsed=self.tick.since_start(),
+            ) from ex
         if not recv_data:
             if self.log_type & RtspClientMsgType.Exception:
-                logfunc('rtsp connection closed by peer')
-            raise RtspConnectionError('RTSP connection closed by peer while waiting for RTP data')
+                logfunc(f'{self.log_tag} rtsp connection closed by peer')
+            raise RtspConnectionError(
+                'RTSP connection closed by peer while waiting for RTP data',
+                session_elapsed=self.tick.since_start(),
+            )
         self.recv_buffer.extend(recv_data)
 
     async def try_get_rtp(self) -> Union[int, Tuple[int, RTP]]:
@@ -1344,16 +1380,20 @@ class RtspSession:
         rtsp_url: RTSP URL to connect to.
         forward_address: Optional TCP target used instead of the parsed RTSP host, see `open_session`.
         timeout: Timeout in seconds for connection, RTSP methods, and RTP receive waits.
-        log_type: Bit flags from :class:`RtspClientMsgType` controlling low-level logging.
+        session_id: Optional unique session identifier used in log tags.
         enable_video: Whether to SETUP and emit video stream events.
         enable_audio: Whether to SETUP and emit audio stream events.
+        log_type: Bit flags from :class:`RtspClientMsgType` controlling low-level logging.
+        log_prefix: Optional human-readable label prepended to every log line.
 
     Note:
         At least one of ``enable_video`` or ``enable_audio`` must be ``True``.
     """
 
     def __init__(self, rtsp_url: str, forward_address: aio.IPAddress = None, timeout: float = 4,
-                 log_type: int = RtspClientMsgType.RTSP, enable_video: bool = True, enable_audio: bool = True):
+                 session_id: Optional[str] = None, enable_video: bool = True, enable_audio: bool = True,
+                 log_type: int = DEFAULT_LOG_TYPE,
+                 log_prefix: str = ''):
         #: Original RTSP URL provided by the caller.
         self.rtsp_url = rtsp_url
         #: Optional TCP forward target used instead of the parsed RTSP host.
@@ -1362,6 +1402,9 @@ class RtspSession:
         self.timeout = timeout
         #: Bit flags controlling low-level logging.
         self.log_type = log_type
+        #: Stable session identifier used in log tags.
+        self.session_id = session_id or f's{next(_session_id_counter):04d}'
+        self.log_tag = f'[{log_prefix}|{self.session_id}]' if log_prefix else f'[{self.session_id}]'
         #: Whether to SETUP and emit video media events.
         self.enable_video = enable_video
         #: Whether to SETUP and emit audio media events.
@@ -1394,6 +1437,8 @@ class RtspSession:
 
         if self._client is None or self._closed:
             return
+        if self.log_type & RtspClientMsgType.Closed:
+            logfunc(f'{self.log_tag} close RTSP connection')
         await self._client.close()
         self._closed = True
 
@@ -1406,11 +1451,12 @@ class RtspSession:
         """
 
         if not self.enable_video and not self.enable_audio:
+            if self.log_type & RtspClientMsgType.Exception:
+                logfunc(f'{self.log_tag} invalid session config: enable_video and enable_audio cannot both be False')
             raise ValueError('At least one of enable_video or enable_audio must be True')
 
-        self._client = RtspClient(self.rtsp_url, self.forward_address)
-        self._client.timeout = self.timeout
-        self._client.log_type = self.log_type
+        self._client = RtspClient(self.rtsp_url, self.forward_address, self.timeout,
+                                  log_type=self.log_type, log_tag=self.log_tag)
         self._closed = False
         rtsp = self._client
 
@@ -1420,12 +1466,18 @@ class RtspSession:
                 ex = None
             except (TimeoutError, asyncio.TimeoutError) as ex:
                 if self.log_type & RtspClientMsgType.Exception:
-                    logfunc(f'RTSP connect timeout exception: {ex!r}')
-                raise RtspTimeoutError(f'RTSP connect timed out after {self.timeout}s') from ex
+                    logfunc(f'{self.log_tag} RTSP connect timeout exception: {ex!r}')
+                raise RtspTimeoutError(
+                    f'RTSP connect timed out after {self.timeout}s',
+                    session_elapsed=rtsp.tick.since_start()
+                ) from ex
             except Exception as ex:
                 if self.log_type & RtspClientMsgType.Exception:
-                    logfunc(f'RTSP connect exception: {ex!r}')
-                raise RtspConnectionError(f'RTSP connect failed: {ex!r}') from ex
+                    logfunc(f'{self.log_tag} RTSP connect exception: {ex!r}')
+                raise RtspConnectionError(
+                    f'RTSP connect failed: {ex!r}',
+                    session_elapsed=rtsp.tick.since_start()
+                ) from ex
 
             connect_elapsed = rtsp.tick.since_last()
             yield ConnectResultEvent(
@@ -1469,9 +1521,9 @@ class RtspSession:
             self._ensure_ok('PLAY', rtsp_resp)
 
             if rtsp.rtps_before_play_response:
-                logfunc(f'got {len(rtsp.rtps_before_play_response)} rtp packets before play response')
+                logfunc(f'{self.log_tag} got {len(rtsp.rtps_before_play_response)} rtp packets before play response')
                 for channel, rtp in rtsp.rtps_before_play_response:
-                    logfunc(f'{channel}: {rtp}')
+                    logfunc(f'{self.log_tag} {channel}: {rtp}')
                     rtp.recv_tick = Tick.process_tick()
                     yield self._new_rtp_event(channel, rtp)
                 rtsp.rtps_before_play_response.clear()
@@ -1501,7 +1553,12 @@ class RtspSession:
         except RtspError:
             raise
         except Exception as ex:
-            raise RtspProtocolError(f'RTSP {method} failed: {ex!r}') from ex
+            if self.log_type & RtspClientMsgType.Exception:
+                logfunc(f'{self.log_tag} RTSP {method} ex={ex!r}\n{traceback.format_exc()}')
+            raise RtspProtocolError(
+                f'RTSP {method} failed: {ex!r}',
+                session_elapsed=self._client.tick.since_start(),
+            ) from ex
 
     def _new_method_event(self, method: str, response: RtspResponse, media_type: Optional[str] = None) -> RtspMethodEvent:
         return RtspMethodEvent(
@@ -1525,7 +1582,15 @@ class RtspSession:
 
     def _ensure_ok(self, method: str, response: RtspResponse, media_type: Optional[str] = None) -> None:
         if response.status_code != 200:
-            raise RtspResponseError(method, response.status_code, response, media_type)
+            if self.log_type & RtspClientMsgType.Exception:
+                logfunc(f'{self.log_tag} RTSP {method} failed with status code {response.status_code}')
+            raise RtspResponseError(
+                method,
+                response.status_code,
+                response,
+                media_type,
+                session_elapsed=self._client.tick.since_start(),
+            )
 
     async def _recv_loop(self, stop_event: Optional[StopEventLike] = None,
                          max_time: float = 0) -> AsyncGenerator[RtspEvent, None]:
@@ -1536,8 +1601,11 @@ class RtspSession:
                 ret = await rtsp.try_get_rtp()
             except Exception as ex:
                 if rtsp.log_type & RtspClientMsgType.Exception:
-                    logfunc(f'rtp parse exception: {ex!r}')
-                raise RtspProtocolError(f'Failed while parsing RTP: {ex!r}') from ex
+                    logfunc(f'{self.log_tag} rtp parse exception: {ex!r}\n{traceback.format_exc()}')
+                raise RtspProtocolError(
+                    f'Failed while parsing RTP: {ex!r}',
+                    session_elapsed=rtsp.tick.since_start(),
+                ) from ex
             if isinstance(ret, int):
                 if ret == -1:
                     break
@@ -1546,13 +1614,13 @@ class RtspSession:
 
             channel, rtp = ret
             if rtsp.log_type & RtspClientMsgType.RTP:
-                logfunc(f'{rtsp.media_channels[channel]}: {rtp}')
+                logfunc(f'{self.log_tag} {rtsp.media_channels[channel]}: {rtp}')
             yield self._new_rtp_event(channel, rtp)
 
             if self.enable_video and channel == rtsp.video_rtp_channel:
                 for vframe in rtsp.video_splicer.try_get_video_frame(rtp):
                     if rtsp.log_type & RtspClientMsgType.VideoFrame:
-                        logfunc(f'{vframe}')
+                        logfunc(f'{self.log_tag} {vframe}')
                     yield VideoFrameEvent(
                         event='video_frame',
                         msg_type=RtspClientMsgType.VideoFrame,
@@ -1564,7 +1632,7 @@ class RtspSession:
                 if rtsp.audio_splicer:
                     for aframe in rtsp.audio_splicer.try_get_audio_frames(rtp):
                         if rtsp.log_type & RtspClientMsgType.AudioFrame:
-                            logfunc(f'{aframe}')
+                            logfunc(f'{self.log_tag} {aframe}')
                         yield AudioFrameEvent(
                             event='audio_frame',
                             msg_type=RtspClientMsgType.AudioFrame,
@@ -1581,8 +1649,8 @@ class RtspSession:
 
 
 def open_session(rtsp_url: str, forward_address: aio.IPAddress = None, timeout: float = 4,
-                 log_type: int = RtspClientMsgType.RTSP, enable_video: bool = True,
-                 enable_audio: bool = True) -> RtspSession:
+                 session_id: Optional[str] = None, enable_video: bool = True, enable_audio: bool = True,
+                 log_type: int = DEFAULT_LOG_TYPE, log_prefix: str = '') -> RtspSession:
     """Convenience factory returning a :class:`RtspSession`.
 
     Args:
@@ -1617,9 +1685,11 @@ def open_session(rtsp_url: str, forward_address: aio.IPAddress = None, timeout: 
                 is mainly for cases where you want to preserve the original RTSP
                 URL while routing the socket through a different network address.
         timeout: Timeout in seconds for connection, RTSP methods, and RTP receive waits.
-        log_type: Bit flags from :class:`RtspClientMsgType` controlling low-level logging.
+        session_id: Optional unique session identifier used in log tags.
         enable_video: Whether to SETUP and emit video stream events.
         enable_audio: Whether to SETUP and emit audio stream events.
+        log_type: Bit flags from :class:`RtspClientMsgType` controlling low-level logging.
+        log_prefix: Optional human-readable label prepended to every log line.
 
     Note:
         At least one of ``enable_video`` or ``enable_audio`` must be ``True``.
@@ -1630,6 +1700,8 @@ def open_session(rtsp_url: str, forward_address: aio.IPAddress = None, timeout: 
         forward_address=forward_address,
         timeout=timeout,
         log_type=log_type,
+        log_prefix=log_prefix,
+        session_id=session_id,
         enable_video=enable_video,
         enable_audio=enable_audio,
     )

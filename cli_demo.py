@@ -1,9 +1,15 @@
-import os, sys
+import os
+import sys
 import asyncio
+import io
+import fractions
 import queue
 import traceback
 import threading
-from typing import Tuple, List, AsyncGenerator, Any
+from typing import Any, List
+
+import av
+import PIL.Image
 
 import aio_sockets as aio
 import aio_rtsp_toolkit as aiortsp
@@ -20,7 +26,9 @@ aiortsp.client.logfunc = log
 async def aplay_with_queue(rtsp_url: str, forward_address: aio.IPAddress, stop_event: threading.Event,
                            que: queue.Queue, timeout:int, log_type: int):
     try:
-        async with open_session(rtsp_url, forward_address, timeout, log_type) as session:
+        async with open_session(rtsp_url, forward_address, timeout,
+                                session_id='s01', log_type=log_type,
+                                log_prefix='cam01') as session:
             async for event in session.iter_events(stop_event):
                 que.put(event)
     except Exception as ex:
@@ -29,11 +37,7 @@ async def aplay_with_queue(rtsp_url: str, forward_address: aio.IPAddress, stop_e
 
 
 def pyav_play(rtsp_url: str, forward_address: aio.IPAddress, play_time: int, timeout: int,
-              log_type: int = aiortsp.RtspClientMsgType.RTSP):
-    import io
-    import fractions
-    import av
-    import PIL.Image
+              log_type: int = aiortsp.DEFAULT_LOG_TYPE):
 
     stop_event = threading.Event()
     que = queue.Queue()
@@ -72,7 +76,7 @@ def pyav_play(rtsp_url: str, forward_address: aio.IPAddress, play_time: int, tim
                 if event.local_addr is None:
                     break
             elif isinstance(event, RtspMethodEvent):
-                log(f'{Tick.process_tick()} {Fore.Green}RTSP {event.method}{Fore.Reset}')
+                log(f'{Tick.process_tick()} {Fore.Green}RTSP {event.method}{Fore.Reset} session_elapsed={event.session_elapsed}')
                 if event.method == 'DESCRIBE':
                     if event.status_code == 200:
                         video_sdp = event.response.sdp.get('video', None)
@@ -95,7 +99,7 @@ def pyav_play(rtsp_url: str, forward_address: aio.IPAddress, play_time: int, tim
                         if audio_sdp:
                             audio_player.configure(audio_sdp)
             elif isinstance(event, RtpPacketEvent):
-                log(f'{Tick.process_tick()} {Fore.Green}{event.media_channel} {event.rtp}{Fore.Reset}')
+                log(f'{Tick.process_tick()} {Fore.Green}{event.media_channel} {event.rtp}{Fore.Reset} session_elapsed={event.session_elapsed}')
             elif isinstance(event, VideoFrameEvent):
                 vframe = event.frame
                 if fout:
@@ -111,23 +115,23 @@ def pyav_play(rtsp_url: str, forward_address: aio.IPAddress, play_time: int, tim
                     is_corrupt_frame[vframe.timestamp] = True
                 if not got_i_frame:
                     if codec_name_lower == aiortsp.H264CodecName:
-                        if not (5 <=vframe.nalu_type <= 8):
-                            log(f'{Tick.process_tick()} skip raw {vframe}')
+                        if not (aiortsp.client.H264RTPNalUnitType.IDR <=vframe.nalu_type <= aiortsp.client.H264RTPNalUnitType.PPS):
+                            log(f'{Tick.process_tick()} skip raw {vframe} session_elapsed={event.session_elapsed}')
                             continue
                     elif codec_name_lower == aiortsp.H265CodecName:
-                        if not (16 <=vframe.nalu_type <= 40):
-                            log(f'{Tick.process_tick()} skip raw {vframe}')
+                        if not (aiortsp.client.H265RTPNalUnitType.BLA_W_LP <=vframe.nalu_type <= aiortsp.client.H265RTPNalUnitType.SUFFIX_SEI_NUT):
+                            log(f'{Tick.process_tick()} skip raw {vframe} session_elapsed={event.session_elapsed}')
                             continue
                     if is_corrupt_frame.get(vframe.timestamp, False):
-                        log(f'{Tick.process_tick()} {Fore.Yellow}skip corrupt raw {vframe}{Fore.Reset}')
+                        log(f'{Tick.process_tick()} {Fore.Yellow}skip corrupt raw {vframe}{Fore.Reset} session_elapsed={event.session_elapsed}')
                         continue
-                log(f'{Tick.process_tick()} {Fore.Green}raw {vframe}{Fore.Reset}')
+                log(f'{Tick.process_tick()} {Fore.Green}raw {vframe}{Fore.Reset} session_elapsed={event.session_elapsed}')
                 input_video_frames.append(vframe)
                 if codec_name_lower == aiortsp.H264CodecName:
-                    is_key_frame[vframe.timestamp] = 5 <= vframe.nalu_type <= 8
+                    is_key_frame[vframe.timestamp] = aiortsp.client.H264RTPNalUnitType.IDR <=vframe.nalu_type <= aiortsp.client.H264RTPNalUnitType.PPS
                     got_i_frame = True
                 elif codec_name_lower == aiortsp.H265CodecName:
-                    is_key_frame[vframe.timestamp] = 16 <= vframe.nalu_type <= 40
+                    is_key_frame[vframe.timestamp] = aiortsp.client.H265RTPNalUnitType.BLA_W_LP <=vframe.nalu_type <= aiortsp.client.H265RTPNalUnitType.SUFFIX_SEI_NUT
                     got_i_frame = True
                 if codec:
                     packets: List[av.Packet] = codec.parse(vframe.data)
@@ -161,20 +165,20 @@ def pyav_play(rtsp_url: str, forward_address: aio.IPAddress, play_time: int, tim
                             # if first I frame is not complete or no I frame before P frames
                             if output_video_frame_timestmaps: # if decode failed after an output frame, assume failed
                                 decode_fail_count += 1
-                            log(f'{Tick.process_tick()} {Fore.Red}decode {packet.pts} error{Fore.Reset}, Exception={ex!r}')
+                            log(f'{Tick.process_tick()} {Fore.Red}decode {packet.pts} error{Fore.Reset}, ex={ex!r}')
             elif isinstance(event, AudioFrameEvent):
                 aframe = event.frame
-                log(f'{Tick.process_tick()} {Fore.Green}audio {aframe}{Fore.Reset}')
+                log(f'{Tick.process_tick()} {Fore.Green}audio {aframe}{Fore.Reset} session_elapsed={event.session_elapsed}')
                 audio_player.feed(aframe)
             elif isinstance(event, ClosedEvent):
-                log(f'{Tick.process_tick()} {Fore.Green}RtspClientMsgType.Closed{Fore.Reset}')
+                log(f'{Tick.process_tick()} {Fore.Green}RtspClientMsgType.Closed{Fore.Reset} session_elapsed={event.session_elapsed}')
                 break
             elif isinstance(event, aiortsp.RtspTimeoutError):
-                log(f'{Tick.process_tick()} {Fore.Red}rtsp timeout{Fore.Reset}: {event!r}'
+                log(f'{Tick.process_tick()} {Fore.Red}rtsp timeout{Fore.Reset}: {event!r} session_elapsed={event.session_elapsed}'
                     f'\n{"".join(traceback.format_exception(event))}')
                 break
             elif isinstance(event, aiortsp.RtspConnectionError):
-                log(f'{Tick.process_tick()} {Fore.Red}rtsp connection error{Fore.Reset}: {event!r}'
+                log(f'{Tick.process_tick()} {Fore.Red}rtsp connection error{Fore.Reset}: {event!r} session_elapsed={event.session_elapsed}'
                     f'\n{"".join(traceback.format_exception(event))}')
                 break
             elif isinstance(event, Exception):
@@ -245,5 +249,4 @@ if __name__ == '__main__':
         index = args.forward.rfind(':')
         forward_addr = (args.forward[:index], int(args.forward[index+1:]))
 
-    log_type = aiortsp.RtspClientMsgType.ConnectResult | aiortsp.RtspClientMsgType.RTSP
-    pyav_play(args.url, forward_addr, args.time, args.timeout, log_type)
+    pyav_play(args.url, forward_addr, args.time, args.timeout, aiortsp.DEFAULT_LOG_TYPE)

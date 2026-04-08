@@ -7,6 +7,7 @@ from .audio_codecs import (
     decode_g711_to_pcm16_bytes,
 )
 from .client import (
+    DEFAULT_LOG_TYPE,
     AACAudioSplicer,
     AudioFrame,
     AudioFrameEvent,
@@ -47,6 +48,7 @@ __all__ = [
     'decode_g711_alaw_byte',
     'decode_g711_mulaw_byte',
     'decode_g711_to_pcm16_bytes',
+    'DEFAULT_LOG_TYPE',
     'H264CodecName',
     'H265CodecName',
     'HEVCCodecName',
