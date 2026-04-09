@@ -1,3 +1,9 @@
+"""Async RTSP/TCP file server.
+
+Serves local media files over RTSP interleaved TCP. Container video/audio tracks
+are streamed directly when supported, and WAV input is resampled and encoded as
+PCMA 8 kHz mono before being advertised and sent to RTSP clients."""
+
 import asyncio
 import base64
 import binascii
@@ -13,21 +19,16 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import aio_sockets as aio
-
-try:
-    import av
-except Exception:  # pragma: no cover - optional dependency at runtime
-    av = None
+import av
 
 
 H264CodecName = 'h264'
 H265CodecName = 'h265'
-HEVCCodecName = 'hevc'
 
 ALLOWED_EXTENSIONS = {".mp4", ".mkv", ".wav", ".aac"}
 DEFAULT_USER_AGENT = "python aio rtsp server"
 MAX_RTP_PAYLOAD = 1400
-logfunc = print
+logger: aio.LoggerLike = aio.StdoutLogger()
 
 
 def _is_disconnect_error(ex: BaseException) -> bool:
@@ -324,7 +325,7 @@ class RtspServerSession:
                 if request is None:
                     break
                 method, uri, version, headers, body = request
-                logfunc(f"{self.peername} {method} {uri}")
+                logger.info(f"{self.peername} {method} {uri}")
                 try:
                     if method == "OPTIONS":
                         await self._handle_options(headers)
@@ -346,18 +347,18 @@ class RtspServerSession:
                     else:
                         await self._send_response(headers, 405, "Method Not Allowed")
                 except FileNotFoundError as ex:
-                    logfunc(f"{self.peername} {method} not found: {ex}")
+                    logger.warning(f"{self.peername} {method} not found: {ex}")
                     await self._send_response(headers, 404, "Not Found")
                 except ValueError as ex:
-                    logfunc(f"{self.peername} {method} bad request: {ex}")
+                    logger.warning(f"{self.peername} {method} bad request: {ex}")
                     await self._send_response(headers, 400, "Bad Request", body=str(ex).encode("utf-8"))
                 except RtspServerError as ex:
-                    logfunc(f"{self.peername} {method} media error: {ex}")
+                    logger.warning(f"{self.peername} {method} media error: {ex}")
                     await self._send_response(headers, 415, "Unsupported Media", body=str(ex).encode("utf-8"))
                 except Exception as ex:
                     if _is_disconnect_error(ex):
                         break
-                    logfunc(f"{self.peername} {method} error: {ex!r}\n{traceback.format_exc()}")
+                    logger.error(f"{self.peername} {method} error: {ex!r}\n{traceback.format_exc()}")
                     with contextlib.suppress(Exception):
                         await self._send_response(headers, 500, "Internal Server Error")
         finally:
@@ -373,7 +374,7 @@ class RtspServerSession:
         if self.closed:
             return
         self.closed = True
-        logfunc(f"{self.peername} disconnected")
+        logger.info(f"{self.peername} disconnected")
         with contextlib.suppress(BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
             await self.sock.close()
 
@@ -539,7 +540,7 @@ class RtspServerSession:
             except Exception as ex:
                 if _is_disconnect_error(ex):
                     break
-                logfunc(f"{self.peername} stream error: {ex!r}\n{traceback.format_exc()}")
+                logger.error(f"{self.peername} stream error: {ex!r}\n{traceback.format_exc()}")
                 break
             if remaining_plays > 0:
                 remaining_plays -= 1
@@ -549,8 +550,6 @@ class RtspServerSession:
             await self._close_transport()
 
     async def _stream_container(self) -> None:
-        if av is None:
-            raise RtspServerError("PyAV is required for mp4/mkv/aac streaming")
         stream_states = {
             state.info.av_stream_index: state
             for state in self.track_states.values()
@@ -620,8 +619,6 @@ class RtspServerSession:
             state.packet_time_cursor = state.media_time_offset
 
     async def _stream_wav(self) -> None:
-        if av is None:
-            raise RtspServerError("PyAV is required for wav streaming")
         state = next((it for it in self.track_states.values() if it.rtp_channel is not None), None)
         if state is None:
             return
@@ -737,7 +734,7 @@ class RtspServerSession:
         if state.logged_first_frame:
             return
         state.logged_first_frame = True
-        logfunc(
+        logger.info(
             f"{self.peername} first {state.info.media_type} frame "
             f"codec={state.info.codec_name} track={state.info.control} "
             f"timestamp={timestamp} size={size}"
@@ -902,7 +899,7 @@ class RtspServer:
 
     async def start(self) -> "RtspServer":
         self._server = await aio.start_tcp_server(self._handle_client, self.host, self.port)
-        logfunc(f"RTSP server listening on {self.host}:{self.port}, dir={self.root_dir}")
+        logger.info(f"RTSP server listening on {self.host}:{self.port}, dir={self.root_dir}")
         return self
 
     async def serve_forever(self) -> None:
@@ -920,7 +917,7 @@ class RtspServer:
 
     async def _handle_client(self, sock: aio.TCPSocket) -> None:
         session = RtspServerSession(self, sock)
-        logfunc(f"{session.peername} connected")
+        logger.info(f"{session.peername} connected")
         try:
             await session.run()
         except Exception as ex:
@@ -943,11 +940,13 @@ class RtspServer:
 
     def build_content_base(self, uri: str, headers: Dict[str, str]) -> str:
         parsed = urllib.parse.urlsplit(uri)
-        host_header = headers.get("Host")
-        if host_header:
-            netloc = host_header
-        else:
-            netloc = f"{self.host}:{self.port}"
+        netloc = parsed.netloc.rsplit("@", 1)[-1]
+        if not netloc:
+            host_header = headers.get("Host")
+            if host_header:
+                netloc = host_header
+            else:
+                netloc = f"{self.host}:{self.port}"
         path = parsed.path
         if not path.endswith("/"):
             path += "/"
@@ -979,11 +978,7 @@ class RtspServer:
     def load_media_source(self, file_path: Path) -> MediaSource:
         suffix = file_path.suffix.lower()
         if suffix == ".wav":
-            if av is None:
-                raise RtspServerError("PyAV is required for wav streaming")
             return self._load_wav_source(file_path)
-        if av is None:
-            raise RtspServerError("PyAV is required for mp4/mkv/aac streaming")
         return self._load_av_source(file_path)
 
     def _load_wav_source(self, file_path: Path) -> MediaSource:

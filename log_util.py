@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-# author: yinkaisheng@foxmail.com
+
 import os
 import sys
 import time
@@ -130,7 +129,7 @@ try:
 
     from loguru import logger
 
-    def config_logger(logger, log_level = 'info', log_dir = 'logs', log_file = 'app.log',
+    def config_logger(logger, log_level = 'info', log_dir = '', log_file = '',
                       backup_count = 15, log_to_stdout = True):
         def add_thread_native_id(record):
             record['extra']['thread'] = threading.get_native_id
@@ -164,8 +163,9 @@ try:
                 '{file},{line} <light-blue>T{thread}</light-blue> <light-cyan>{function}</light-cyan>'
                 ': <lvl>{message}</lvl>')
             _stdout_logger_id = logger.add(sys.stdout, level=log_level, colorize=True, format=console_format)
-        logger.add(f'{log_dir}/{log_file}', level=log_level, enqueue=True, rotation=f'00:00:00',
-                   retention=backup_count, compression='zip', format=file_format)
+        if log_dir and log_file:
+            logger.add(f'{log_dir}/{log_file}', level=log_level, enqueue=True, rotation=f'00:00:00',
+                    retention=backup_count, compression='zip', format=file_format)
 
 except ImportError:
 
@@ -214,7 +214,7 @@ except ImportError:
                 print(f"can not find: {old_log_path}")
 
 
-    def config_logger(logger: logging.Logger, log_level = 'info', log_dir = 'logs', log_file = 'app.log',
+    def config_logger(logger: logging.Logger, log_level = 'info', log_dir = '', log_file = '',
                       backup_count = 15, log_to_stdout = True):
         if log_dir and log_dir != '.':
             os.makedirs(log_dir, exist_ok=True)
@@ -222,6 +222,8 @@ except ImportError:
         logging.Formatter.default_msec_format = '%s.%03d'
         file_formatter = LogFormatter('%(asctime)s %(levelname)s T%(thread)d L%(lineno)d %(funcName)s: %(message)s')
         logger.setLevel(log_level)
+        if not (log_dir and log_file):
+            return
         file_handler = ZipTimedRotatingFileHandler(
             f'{log_dir}/{log_file}',
             when="midnight",    # midnight

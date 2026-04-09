@@ -30,11 +30,13 @@ Optional extras:
 
 ```shell
 pip install aio-rtsp-toolkit[server]
+pip install aio-rtsp-toolkit[decode]
 pip install aio-rtsp-toolkit[audio]
 pip install aio-rtsp-toolkit[all]
 ```
 
 - `[server]`: installs `av` for RTSP file serving
+- `[decode]`: installs `numpy` and `av` for audio PCM decode helpers
 - `[audio]`: installs `numpy`, `sounddevice`, and `av` for audio playback helpers
 - `[all]`: installs all optional dependencies
 
@@ -183,11 +185,18 @@ async def main():
 asyncio.run(main())
 ```
 
-### Optional Audio Playback Helpers
+### Optional Audio Decode / Playback Helpers
 
-`aio_rtsp_toolkit.audio_playback.SoundDeviceAudioPlayer` can decode and play audio frames.
+`aio_rtsp_toolkit.audio_decode.AudioPCMDecoder` can decode audio frames to PCM `s16le`.
 
-- Install the `[audio]` extra for `numpy`, `sounddevice`, and `av`
+- `feed()` returns a list of `PCMFrame` objects
+- `PCMFrame.pcm_bytes` contains interleaved PCM bytes
+- Set `output_sample_rate` to resample to a target rate
+- Leave `output_sample_rate=None` to keep the source sample rate
+
+`aio_rtsp_toolkit.audio_playback.SoundDeviceAudioPlayer` builds on the decoder in `audio_decode` and plays the decoded PCM immediately.
+
+- Install the `[decode]` extra for PCM decode only, or `[audio]` for decode + playback
 - G.711 A-law and mu-law playback do not require PyAV
 - AAC and AAC-LATM playback do require PyAV
 
@@ -208,6 +217,24 @@ python pyqt_demo.py
 ### CLI Demo
 
 `cli_demo.py` logs RTSP timing, writes raw video to disk, and decodes frames with PyAV.
+
+You can still change the source defaults in the script, but it now also supports runtime control:
+
+```shell
+python cli_demo.py -u rtsp://127.0.0.1:8554/morning_h264.mp4
+python cli_demo.py -u rtsp://127.0.0.1:8554/morning_h264.mp4 --audio-mode decode --audio-rate 16000
+python cli_demo.py -u rtsp://127.0.0.1:8554/morning_h264.mp4 --save-audio ""
+python cli_demo.py -u rtsp://127.0.0.1:8554/morning_h264.mp4 --audio-mode play --audio-rate 16000 --session-id s01 --log-prefix cam01
+```
+
+- `--audio-mode decode`: decode audio to PCM
+- `--audio-mode play`: decode audio and play it
+- `--audio-rate 16000`: resample output PCM to `16000`
+- omit `--audio-rate`: keep the source sample rate without resampling
+- `--save-audio audio.wav`: save decoded audio to WAV, default is `audio.wav`
+- `--save-audio ""`: disable audio saving
+- `--session-id s01`: set the session id used by RTSP/audio logs
+- `--log-prefix cam01`: set the log prefix used by RTSP/audio logs
 
 Install the `[all]` extra for PyAV, then install `Pillow` if you want to save the first decoded frame as an image.
 

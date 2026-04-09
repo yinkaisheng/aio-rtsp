@@ -23,11 +23,10 @@ from aio_rtsp_toolkit import (
     open_session,
 )
 from aio_rtsp_toolkit.audio_playback import SoundDeviceAudioPlayer
-from log_util import Fore, log, logger, config_logger
+from log_util import logger, config_logger
 
 
-aio.aio_sockets.logfunc = logger.info
-aiortsp.client.logfunc = logger.info
+aiortsp.client.logger = logger
 
 
 class VideoLabel(QtWidgets.QLabel):
@@ -103,7 +102,7 @@ class RtspPlayerThread(QtCore.QThread):
         th.start()
 
         codec: Optional[av.codec.context.CodecContext] = None
-        audio_player = SoundDeviceAudioPlayer(self.log_ready.emit)
+        audio_player = SoundDeviceAudioPlayer()
         timestamps: List[int] = []
         is_key_frame = {}
         is_corrupt_frame = {}

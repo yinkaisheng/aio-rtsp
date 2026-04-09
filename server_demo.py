@@ -1,9 +1,13 @@
+#!/usr/bin/env python3
+
 import asyncio
 
 import aio_sockets as aio
 import aio_rtsp_toolkit as aiortsp
-from log_util import Fore, log, logger, config_logger
+from log_util import logger, config_logger
 
+
+aiortsp.server.logger = logger
 
 
 def main() -> None:
@@ -17,12 +21,9 @@ def main() -> None:
 
     use_file_logger = 1
     if use_file_logger:
-        aio.aio_sockets.logfunc = logger.info
-        aiortsp.server.logfunc = logger.info
         config_logger(logger, 'info', log_dir='logs', log_file='rtsp_server.log')
     else:
-        aio.aio_sockets.logfunc = log
-        aiortsp.server.logfunc = log
+        config_logger(logger, 'info')
 
     asyncio.run(aiortsp.serve(args.dir, args.host, args.port))
 

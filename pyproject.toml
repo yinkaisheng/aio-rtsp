@@ -20,6 +20,7 @@ dependencies = ["aio-sockets"]
 
 [project.optional-dependencies]
 server = ["av"]
+decode = ["numpy", "av"]
 audio = ["numpy", "sounddevice", "av"]
 all = ["numpy", "sounddevice", "av"]
 
