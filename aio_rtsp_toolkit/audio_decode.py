@@ -104,6 +104,7 @@ class AudioPCMDecoder:
         self.output_sample_rate = int(output_sample_rate or 0)
         self.resampler = None
         self.resampler_key = None
+        self.logged_first_pcm_frame = False
 
     def configure(self, audio_sdp: Dict[str, Any]) -> bool:
         av_codec_name, extradata = get_av_audio_codec_params(audio_sdp)
@@ -216,6 +217,14 @@ class AudioPCMDecoder:
     def _pcm_frame_from_array(self, pcm, sample_rate: int, channels: int) -> PCMFrame:
         pcm = self.numpy.ascontiguousarray(pcm, dtype=self.numpy.int16)
         samples_per_channel = int(pcm.shape[0]) if pcm.ndim >= 1 else 0
+        if not self.logged_first_pcm_frame and samples_per_channel > 0:
+            self.logged_first_pcm_frame = True
+            duration_ms = samples_per_channel * 1000.0 / float(sample_rate or 1)
+            logger.info(
+                f'{self.log_tag}{Tick.process_tick()} First decoded audio PCM frame: '
+                f'codec={self.source_codec_name or self.codec_name}, sample_rate={sample_rate}, '
+                f'channels={channels}, samples_per_channel={samples_per_channel}, duration_ms={duration_ms:.2f}'
+            )
         return PCMFrame(
             pcm_bytes=pcm.tobytes(),
             sample_rate=sample_rate,
@@ -228,3 +237,4 @@ class AudioPCMDecoder:
         self.resampler = None
         self.resampler_key = None
         self.source_codec_name = ''
+        self.logged_first_pcm_frame = False

@@ -7,9 +7,11 @@ PCMA 8 kHz mono before being advertised and sent to RTSP clients."""
 import asyncio
 import base64
 import binascii
+import concurrent.futures
 import contextlib
 import random
 import struct
+import threading
 import time
 import traceback
 import urllib.parse
@@ -298,9 +300,44 @@ class StreamTrackState:
     logged_first_frame: bool = False
     media_time_offset: float = 0.0
     packet_time_cursor: float = 0.0
+    packet_count: int = 0
+    octet_count: int = 0
+    last_rtp_timestamp: int = 0
+    last_rtp_send_time: Optional[float] = None
+    last_rtcp_send_time: Optional[float] = None
+
+
+@dataclass
+class QueuedMediaPacket:
+    kind: str
+    track_control: str
+    data: bytes = b""
+    media_time: float = 0.0
+    duration_seconds: float = 0.0
+    is_keyframe: bool = False
+    sample_cursor: Optional[int] = None
+
+
+@dataclass
+class QueuedLoopState:
+    kind: str
+    track_control: str
+    media_time_offset: float = 0.0
+    packet_time_cursor: float = 0.0
+    sample_cursor: Optional[int] = None
+
+
+@dataclass
+class QueuedWorkerSignal:
+    kind: str
+    message: str = ""
 
 
 class RtspServerError(Exception):
+    pass
+
+
+class RtspBadRequestError(ValueError):
     pass
 
 
@@ -315,16 +352,30 @@ class RtspServerSession:
         self.content_base: str = ""
         self.track_states: Dict[str, StreamTrackState] = {}
         self.stream_task: Optional[asyncio.Task] = None
+        self.timeout_task: Optional[asyncio.Task] = None
         self.closed = False
         self.play_count = 0
+        self.session_active = False
+        self.last_activity_monotonic = time.monotonic()
 
     async def run(self) -> None:
         try:
+            self.timeout_task = asyncio.create_task(
+                self._watch_session_timeout(),
+                name=f"rtsp-timeout-{self.session_id}",
+            )
             while not self.closed:
-                request = await self._read_request()
+                try:
+                    request = await self._read_request()
+                except RtspBadRequestError as ex:
+                    logger.warning(f"{self.peername} bad request: {ex}")
+                    with contextlib.suppress(Exception):
+                        await self._send_response({}, 400, "Bad Request", body=str(ex).encode("utf-8"))
+                    continue
                 if request is None:
                     break
                 method, uri, version, headers, body = request
+                self._mark_activity()
                 logger.info(f"{self.peername} {method} {uri}")
                 try:
                     if method == "OPTIONS":
@@ -336,13 +387,22 @@ class RtspServerSession:
                     elif method == "PLAY":
                         await self._handle_play(headers)
                     elif method == "PAUSE":
+                        if not self._require_valid_session(headers):
+                            await self._send_response(headers, 454, "Session Not Found")
+                            continue
                         await self._stop_streaming()
-                        await self._send_response(headers, 200, "OK", {"Session": self.session_id})
+                        await self._send_response(headers, 200, "OK", {"Session": self._session_header_value()})
                     elif method == "GET_PARAMETER":
-                        await self._send_response(headers, 200, "OK", {"Session": self.session_id})
+                        if not self._require_valid_session(headers):
+                            await self._send_response(headers, 454, "Session Not Found")
+                            continue
+                        await self._send_response(headers, 200, "OK", {"Session": self._session_header_value()})
                     elif method == "TEARDOWN":
+                        if not self._require_valid_session(headers):
+                            await self._send_response(headers, 454, "Session Not Found")
+                            continue
                         await self._stop_streaming()
-                        await self._send_response(headers, 200, "OK", {"Session": self.session_id})
+                        await self._send_response(headers, 200, "OK", {"Session": self._session_header_value()})
                         break
                     else:
                         await self._send_response(headers, 405, "Method Not Allowed")
@@ -367,14 +427,22 @@ class RtspServerSession:
     async def close(self) -> None:
         if self.closed:
             return
+        if self.timeout_task is not None:
+            current_task = asyncio.current_task()
+            if self.timeout_task is not current_task:
+                self.timeout_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await self.timeout_task
+            self.timeout_task = None
         await self._stop_streaming()
+        await self._send_rtcp_bye()
         await self._close_transport()
 
     async def _close_transport(self) -> None:
         if self.closed:
             return
         self.closed = True
-        logger.info(f"{self.peername} disconnected")
+        logger.info(f"{self.peername} disconnected session={self.session_id}")
         with contextlib.suppress(BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
             await self.sock.close()
 
@@ -389,36 +457,77 @@ class RtspServerSession:
             if first == b"$":
                 try:
                     header = await self.sock.recv_exactly(3)
+                    channel = header[0]
                     payload_len = struct.unpack("!H", header[1:3])[0]
+                    payload = b""
                     if payload_len > 0:
-                        await self.sock.recv_exactly(payload_len)
+                        payload = await self.sock.recv_exactly(payload_len)
+                    self._handle_interleaved_frame(channel, payload)
                 except asyncio.IncompleteReadError:
                     return None
                 continue
             try:
                 raw = first + await self.sock.recv_until(b"\r\n\r\n")
-            except (asyncio.IncompleteReadError, asyncio.LimitOverrunError):
+            except asyncio.IncompleteReadError:
                 return None
+            except asyncio.LimitOverrunError as ex:
+                raise RtspBadRequestError(f"request header too large: {ex.consumed} bytes")
             header_text = raw.decode("utf-8", errors="replace")
             lines = header_text.split("\r\n")
             if not lines or not lines[0]:
-                return None
+                raise RtspBadRequestError("empty request line")
             parts = lines[0].split(" ", 2)
             if len(parts) != 3:
-                return None
+                raise RtspBadRequestError(f"malformed request line: {lines[0]!r}")
             method, uri, version = parts
+            if not version.startswith("RTSP/"):
+                raise RtspBadRequestError(f"unsupported RTSP version: {version}")
             headers: Dict[str, str] = {}
             for line in lines[1:]:
                 if not line or ":" not in line:
                     continue
                 key, value = line.split(":", 1)
-                headers[key.strip()] = value.strip()
-            content_length = int(headers.get("Content-Length", "0") or "0")
+                headers[key.strip().lower()] = value.strip()
+            content_length_text = headers.get("content-length", "0") or "0"
+            try:
+                content_length = int(content_length_text)
+            except ValueError as ex:
+                raise RtspBadRequestError(f"invalid Content-Length: {content_length_text!r}") from ex
+            if content_length < 0:
+                raise RtspBadRequestError("Content-Length must be greater than or equal to 0")
             body = b""
             if content_length > 0:
                 body = await self.sock.recv_exactly(content_length)
             return method.upper(), uri, version, headers, body
         return None
+
+    def _require_valid_session(self, req_headers: Dict[str, str]) -> bool:
+        session_header = req_headers.get("session", "")
+        if not session_header:
+            return False
+        return session_header.split(";", 1)[0] == self.session_id
+
+    def _mark_activity(self) -> None:
+        self.last_activity_monotonic = time.monotonic()
+
+    def _session_header_value(self) -> str:
+        return f"{self.session_id};timeout={self.server.session_timeout}"
+
+    async def _watch_session_timeout(self) -> None:
+        interval = max(1.0, min(5.0, self.server.session_timeout / 2.0))
+        while not self.closed:
+            await asyncio.sleep(interval)
+            if self.closed or not self.session_active:
+                continue
+            idle_seconds = time.monotonic() - self.last_activity_monotonic
+            if idle_seconds < self.server.session_timeout:
+                continue
+            logger.info(
+                f"{self.peername} session timeout session={self.session_id} "
+                f"idle={idle_seconds:.1f}s timeout={self.server.session_timeout}s"
+            )
+            await self.close()
+            return
 
     async def _handle_options(self, req_headers: Dict[str, str]) -> None:
         await self._send_response(
@@ -434,6 +543,14 @@ class RtspServerSession:
         self.media_source = self.server.load_media_source(resource_path)
         self.content_base = self.server.build_content_base(uri, req_headers)
         self.track_states = {track.control: StreamTrackState(track) for track in self.media_source.tracks}
+        track_summary = ", ".join(
+            f"{track.control}:{track.media_type}/{track.codec_name}/{track.clock_rate}"
+            for track in self.media_source.tracks
+        )
+        logger.info(
+            f"{self.peername} describe session={self.session_id} source={resource_path.name} "
+            f"play_count={self.play_count} tracks={track_summary}"
+        )
         sdp = self.media_source.build_sdp()
         await self._send_response(
             req_headers,
@@ -450,7 +567,7 @@ class RtspServerSession:
         if self.media_source is None:
             await self._send_response(req_headers, 454, "Session Not Found")
             return
-        session_header = req_headers.get("Session")
+        session_header = req_headers.get("session")
         if session_header and session_header.split(";", 1)[0] != self.session_id:
             await self._send_response(req_headers, 454, "Session Not Found")
             return
@@ -459,19 +576,37 @@ class RtspServerSession:
         if state is None:
             await self._send_response(req_headers, 404, "Not Found")
             return
-        transport = req_headers.get("Transport", "")
+        transport = req_headers.get("transport", "")
         channels = self.server.parse_interleaved_channels(transport)
         if channels is None:
             await self._send_response(req_headers, 461, "Unsupported Transport")
             return
+        if channels[0] == channels[1]:
+            await self._send_response(req_headers, 400, "Bad Request", body=b"interleaved RTP and RTCP channels must differ")
+            return
+        for other_state in self.track_states.values():
+            if other_state.info.control == state.info.control:
+                continue
+            if channels[0] in (other_state.rtp_channel, other_state.rtcp_channel) or channels[1] in (
+                other_state.rtp_channel,
+                other_state.rtcp_channel,
+            ):
+                await self._send_response(req_headers, 400, "Bad Request", body=b"interleaved channels already in use")
+                return
         state.rtp_channel, state.rtcp_channel = channels
+        self.session_active = True
+        self._mark_activity()
+        logger.info(
+            f"{self.peername} setup track={state.info.control} codec={state.info.codec_name} "
+            f"rtp_channel={channels[0]} rtcp_channel={channels[1]}"
+        )
         await self._send_response(
             req_headers,
             200,
             "OK",
             {
                 "Transport": f"RTP/AVP/TCP;unicast;interleaved={channels[0]}-{channels[1]}",
-                "Session": f"{self.session_id};timeout=60",
+                "Session": self._session_header_value(),
             },
         )
 
@@ -479,7 +614,7 @@ class RtspServerSession:
         if self.media_source is None:
             await self._send_response(req_headers, 454, "Session Not Found")
             return
-        session_header = req_headers.get("Session", "")
+        session_header = req_headers.get("session", "")
         if session_header.split(";", 1)[0] != self.session_id:
             await self._send_response(req_headers, 454, "Session Not Found")
             return
@@ -498,10 +633,19 @@ class RtspServerSession:
             200,
             "OK",
             {
-                "Session": self.session_id,
+                "Session": self._session_header_value(),
                 "Range": "npt=0.000-",
                 "RTP-Info": ",".join(rtp_info),
             },
+        )
+        active_tracks = [
+            f"{state.info.control}:{state.info.codec_name}/rtp={state.rtp_channel}/rtcp={state.rtcp_channel}"
+            for state in self.track_states.values()
+            if state.rtp_channel is not None
+        ]
+        logger.info(
+            f"{self.peername} play session={self.session_id} play_count={self.play_count} "
+            f"tracks={', '.join(active_tracks)}"
         )
         self.stream_task = asyncio.create_task(self._stream_media(), name=f"rtsp-stream-{self.session_id}")
 
@@ -517,24 +661,36 @@ class RtspServerSession:
             state.logged_first_frame = False
             state.media_time_offset = 0.0
             state.packet_time_cursor = 0.0
+            state.packet_count = 0
+            state.octet_count = 0
+            state.last_rtp_timestamp = 0
+            state.last_rtp_send_time = None
+            state.last_rtcp_send_time = None
 
     async def _stop_streaming(self) -> None:
         if self.stream_task is None:
             return
         self.stream_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError, Exception):
+        try:
             await self.stream_task
+        except asyncio.CancelledError:
+            pass
+        except Exception as ex:
+            logger.warning(f"{self.peername} stream task stopped with error: {ex!r}")
         self.stream_task = None
 
     async def _stream_media(self) -> None:
         suffix = self.media_source.file_path.suffix.lower()
         remaining_plays = self.play_count
+        loop_index = 0
         while not self.closed:
             try:
-                if suffix == ".wav":
-                    await self._stream_wav()
-                else:
-                    await self._stream_container()
+                loop_index += 1
+                logger.info(
+                    f"{self.peername} stream loop start session={self.session_id} "
+                    f"loop={loop_index} source={self.media_source.file_path.name}"
+                )
+                await self._stream_media_once(suffix)
             except asyncio.CancelledError:
                 raise
             except Exception as ex:
@@ -542,14 +698,122 @@ class RtspServerSession:
                     break
                 logger.error(f"{self.peername} stream error: {ex!r}\n{traceback.format_exc()}")
                 break
+            logger.info(
+                f"{self.peername} stream loop end session={self.session_id} "
+                f"loop={loop_index} source={self.media_source.file_path.name}"
+            )
             if remaining_plays > 0:
                 remaining_plays -= 1
                 if remaining_plays == 0:
                     break
         if not self.closed and self.play_count > 0 and remaining_plays == 0:
-            await self._close_transport()
+            logger.info(f"{self.peername} play_count exhausted, closing session={self.session_id}")
+            await self.close()
 
-    async def _stream_container(self) -> None:
+    async def _stream_media_once(self, suffix: str) -> None:
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue = asyncio.Queue(maxsize=32)
+        stop_event = threading.Event()
+        producer = asyncio.create_task(
+            aio.to_thread(self._produce_media_packets, suffix, loop, queue, stop_event)
+        )
+        try:
+            while True:
+                item = await queue.get()
+                if isinstance(item, QueuedWorkerSignal):
+                    if item.kind == "done":
+                        break
+                    if item.kind == "error":
+                        raise RtspServerError(item.message)
+                    continue
+                if isinstance(item, QueuedLoopState):
+                    state = self.track_states.get(item.track_control)
+                    if state is None:
+                        continue
+                    state.media_time_offset = item.media_time_offset
+                    state.packet_time_cursor = item.packet_time_cursor
+                    state.first_source_time = None
+                    if item.sample_cursor is not None:
+                        state.sample_cursor = item.sample_cursor
+                    continue
+                if not isinstance(item, QueuedMediaPacket):
+                    continue
+                state = self.track_states.get(item.track_control)
+                if state is None or state.rtp_channel is None:
+                    continue
+                if item.kind == "video":
+                    await self._send_video_packet(
+                        state,
+                        item.data,
+                        item.media_time,
+                        item.duration_seconds,
+                        item.is_keyframe,
+                    )
+                elif item.kind == "aac":
+                    await self._send_aac_packet(state, item.data, item.media_time, item.duration_seconds)
+                elif item.kind == "pcma":
+                    await self._send_raw_audio_packet(state, item.data, item.media_time, item.duration_seconds)
+                elif item.kind == "wav_pcma":
+                    await self._send_wav_audio_packet(state, item.data, item.sample_cursor or 0)
+            await producer
+        except asyncio.CancelledError:
+            stop_event.set()
+            raise
+        finally:
+            stop_event.set()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await producer
+
+    def _threadsafe_queue_put(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        queue: asyncio.Queue,
+        item,
+        stop_event: threading.Event,
+    ) -> bool:
+        while not stop_event.is_set():
+            future = asyncio.run_coroutine_threadsafe(queue.put(item), loop)
+            try:
+                future.result(timeout=0.5)
+                return True
+            except concurrent.futures.TimeoutError:
+                future.cancel()
+                continue
+            except Exception:
+                future.cancel()
+                return False
+        return False
+
+    def _produce_media_packets(
+        self,
+        suffix: str,
+        loop: asyncio.AbstractEventLoop,
+        queue: asyncio.Queue,
+        stop_event: threading.Event,
+    ) -> None:
+        try:
+            if suffix == ".wav":
+                self._produce_wav_packets(loop, queue, stop_event)
+            else:
+                self._produce_container_packets(loop, queue, stop_event)
+        except Exception as ex:
+            if not stop_event.is_set():
+                self._threadsafe_queue_put(
+                    loop,
+                    queue,
+                    QueuedWorkerSignal(kind="error", message=str(ex)),
+                    stop_event,
+                )
+        finally:
+            if not stop_event.is_set():
+                self._threadsafe_queue_put(loop, queue, QueuedWorkerSignal(kind="done"), stop_event)
+
+    def _produce_container_packets(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        queue: asyncio.Queue,
+        stop_event: threading.Event,
+    ) -> None:
         stream_states = {
             state.info.av_stream_index: state
             for state in self.track_states.values()
@@ -558,10 +822,11 @@ class RtspServerSession:
         if not stream_states:
             return
         loop_end_times: Dict[int, float] = {}
+        first_packet_times: Dict[int, float] = {}
         with av.open(str(self.media_source.file_path), mode="r") as container:
             selected_streams = [container.streams[index] for index in stream_states]
             for packet in container.demux(selected_streams):
-                if self.closed:
+                if self.closed or stop_event.is_set():
                     return
                 state = stream_states.get(packet.stream.index)
                 if state is None or packet.size <= 0:
@@ -581,44 +846,90 @@ class RtspServerSession:
                         duration_seconds = 0.02
                 else:
                     duration_seconds = float(duration_value * packet.time_base)
-                if state.first_source_time is None:
-                    relative_packet_time = 0.0
-                else:
-                    relative_packet_time = max(0.0, packet_time - state.first_source_time)
+                first_packet_time = first_packet_times.setdefault(packet.stream.index, packet_time)
+                relative_packet_time = max(0.0, packet_time - first_packet_time)
+                media_time = state.media_time_offset + relative_packet_time
                 if state.info.media_type == "video":
-                    schedule_time = state.packet_time_cursor
-                    state.packet_time_cursor += max(duration_seconds, 0.0)
+                    schedule_time = max(state.packet_time_cursor, media_time)
+                    state.packet_time_cursor = schedule_time + max(duration_seconds, 0.0)
                     loop_end_times[packet.stream.index] = max(
                         loop_end_times.get(packet.stream.index, 0.0),
                         state.packet_time_cursor,
                     )
-                    await self._send_video_packet(
-                        state,
-                        bytes(packet),
-                        schedule_time,
-                        duration_seconds,
-                        bool(packet.is_keyframe),
-                    )
+                    if not self._threadsafe_queue_put(
+                        loop,
+                        queue,
+                        QueuedMediaPacket(
+                            kind="video",
+                            track_control=state.info.control,
+                            data=bytes(packet),
+                            media_time=schedule_time,
+                            duration_seconds=duration_seconds,
+                            is_keyframe=bool(packet.is_keyframe),
+                        ),
+                        stop_event,
+                    ):
+                        return
                 elif state.info.codec_name == "mpeg4-generic":
+                    state.packet_time_cursor = max(state.packet_time_cursor, media_time + max(duration_seconds, 0.0))
                     loop_end_times[packet.stream.index] = max(
                         loop_end_times.get(packet.stream.index, 0.0),
-                        state.media_time_offset + relative_packet_time + max(duration_seconds, 0.0),
+                        state.packet_time_cursor,
                     )
-                    await self._send_aac_packet(state, bytes(packet), packet_time, duration_seconds)
+                    if not self._threadsafe_queue_put(
+                        loop,
+                        queue,
+                        QueuedMediaPacket(
+                            kind="aac",
+                            track_control=state.info.control,
+                            data=bytes(packet),
+                            media_time=media_time,
+                            duration_seconds=duration_seconds,
+                        ),
+                        stop_event,
+                    ):
+                        return
                 elif state.info.codec_name == "pcma":
+                    state.packet_time_cursor = max(state.packet_time_cursor, media_time + max(duration_seconds, 0.0))
                     loop_end_times[packet.stream.index] = max(
                         loop_end_times.get(packet.stream.index, 0.0),
-                        state.media_time_offset + relative_packet_time + max(duration_seconds, 0.0),
+                        state.packet_time_cursor,
                     )
-                    await self._send_raw_audio_packet(state, bytes(packet), packet_time, duration_seconds)
+                    if not self._threadsafe_queue_put(
+                        loop,
+                        queue,
+                        QueuedMediaPacket(
+                            kind="pcma",
+                            track_control=state.info.control,
+                            data=bytes(packet),
+                            media_time=media_time,
+                            duration_seconds=duration_seconds,
+                        ),
+                        stop_event,
+                    ):
+                        return
         for stream_index, state in stream_states.items():
             end_time = loop_end_times.get(stream_index)
             if end_time is not None:
-                state.media_time_offset = end_time
-            state.first_source_time = None
-            state.packet_time_cursor = state.media_time_offset
+                if not self._threadsafe_queue_put(
+                    loop,
+                    queue,
+                    QueuedLoopState(
+                        kind="loop_state",
+                        track_control=state.info.control,
+                        media_time_offset=end_time,
+                        packet_time_cursor=end_time,
+                    ),
+                    stop_event,
+                ):
+                    return
 
-    async def _stream_wav(self) -> None:
+    def _produce_wav_packets(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        queue: asyncio.Queue,
+        stop_event: threading.Event,
+    ) -> None:
         state = next((it for it in self.track_states.values() if it.rtp_channel is not None), None)
         if state is None:
             return
@@ -628,55 +939,95 @@ class RtspServerSession:
         encoder.sample_rate = 8000
         encoder.layout = "mono"
         encoder.format = "s16"
+        sample_cursor = state.sample_cursor
         with av.open(str(self.media_source.file_path), mode="r") as container:
             audio_stream = next((stream for stream in container.streams if stream.type == "audio"), None)
             if audio_stream is None:
                 raise RtspServerError("No audio stream found in wav file")
             for packet in container.demux([audio_stream]):
-                if self.closed:
+                if self.closed or stop_event.is_set():
                     return
                 for decoded_frame in packet.decode():
                     for resampled_frame in _iter_audio_frames(resampler.resample(decoded_frame)):
                         for encoded_packet in encoder.encode(resampled_frame):
-                            encoded = bytes(encoded_packet)
-                            offset = 0
-                            while offset < len(encoded):
-                                chunk = encoded[offset:offset + packet_samples]
-                                if not chunk:
-                                    break
-                                offset += len(chunk)
-                                timestamp = state.sample_cursor
-                                state.sample_cursor += len(chunk)
-                                self._log_first_frame(state, timestamp, len(chunk))
-                                await self._sleep_until_media_time(state, timestamp / float(state.info.clock_rate or 1))
-                                await self._send_rtp_packet(state, chunk, timestamp=timestamp, marker=1)
+                            sample_cursor = self._enqueue_wav_chunks(
+                                loop,
+                                queue,
+                                stop_event,
+                                state.info.control,
+                                bytes(encoded_packet),
+                                packet_samples,
+                                sample_cursor,
+                            )
+                            if sample_cursor < 0:
+                                return
             for resampled_frame in _iter_audio_frames(resampler.resample(None)):
                 for encoded_packet in encoder.encode(resampled_frame):
-                    encoded = bytes(encoded_packet)
-                    offset = 0
-                    while offset < len(encoded):
-                        chunk = encoded[offset:offset + packet_samples]
-                        if not chunk:
-                            break
-                        offset += len(chunk)
-                        timestamp = state.sample_cursor
-                        state.sample_cursor += len(chunk)
-                        self._log_first_frame(state, timestamp, len(chunk))
-                        await self._sleep_until_media_time(state, timestamp / float(state.info.clock_rate or 1))
-                        await self._send_rtp_packet(state, chunk, timestamp=timestamp, marker=1)
+                    sample_cursor = self._enqueue_wav_chunks(
+                        loop,
+                        queue,
+                        stop_event,
+                        state.info.control,
+                        bytes(encoded_packet),
+                        packet_samples,
+                        sample_cursor,
+                    )
+                    if sample_cursor < 0:
+                        return
             for encoded_packet in encoder.encode(None):
-                encoded = bytes(encoded_packet)
-                offset = 0
-                while offset < len(encoded):
-                    chunk = encoded[offset:offset + packet_samples]
-                    if not chunk:
-                        break
-                    offset += len(chunk)
-                    timestamp = state.sample_cursor
-                    state.sample_cursor += len(chunk)
-                    self._log_first_frame(state, timestamp, len(chunk))
-                    await self._sleep_until_media_time(state, timestamp / float(state.info.clock_rate or 1))
-                    await self._send_rtp_packet(state, chunk, timestamp=timestamp, marker=1)
+                sample_cursor = self._enqueue_wav_chunks(
+                    loop,
+                    queue,
+                    stop_event,
+                    state.info.control,
+                    bytes(encoded_packet),
+                    packet_samples,
+                    sample_cursor,
+                )
+                if sample_cursor < 0:
+                    return
+        self._threadsafe_queue_put(
+            loop,
+            queue,
+            QueuedLoopState(
+                kind="loop_state",
+                track_control=state.info.control,
+                sample_cursor=sample_cursor,
+            ),
+            stop_event,
+        )
+
+    def _enqueue_wav_chunks(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        queue: asyncio.Queue,
+        stop_event: threading.Event,
+        track_control: str,
+        encoded: bytes,
+        packet_samples: int,
+        sample_cursor: int,
+    ) -> int:
+        offset = 0
+        while offset < len(encoded):
+            chunk = encoded[offset:offset + packet_samples]
+            if not chunk:
+                break
+            offset += len(chunk)
+            next_cursor = sample_cursor + len(chunk)
+            if not self._threadsafe_queue_put(
+                loop,
+                queue,
+                QueuedMediaPacket(
+                    kind="wav_pcma",
+                    track_control=track_control,
+                    data=chunk,
+                    sample_cursor=sample_cursor,
+                ),
+                stop_event,
+            ):
+                return -1
+            sample_cursor = next_cursor
+        return sample_cursor
 
     async def _send_video_packet(
         self,
@@ -710,19 +1061,23 @@ class RtspServerSession:
             rtp_payloads.extend(self._packetize_video_nalu(nalu, marker=marker, codec_name=codec_name))
         await self._send_paced_rtp_payloads(state, rtp_payloads, timestamp, media_time, max(duration_seconds, 0.0))
 
-    async def _send_aac_packet(self, state: StreamTrackState, data: bytes, packet_time: float, duration_seconds: float) -> None:
-        source_time = self._relative_source_time(state, packet_time)
-        timestamp = int(round(source_time * state.info.clock_rate))
+    async def _send_aac_packet(self, state: StreamTrackState, data: bytes, media_time: float, duration_seconds: float) -> None:
+        timestamp = int(round(media_time * state.info.clock_rate))
         self._log_first_frame(state, timestamp, len(data))
         au_header = (len(data) << 3).to_bytes(2, "big")
         payload = struct.pack("!H", 16) + au_header + data
-        await self._send_paced_rtp_payloads(state, [(payload, 1)], timestamp, source_time, max(duration_seconds, 0.0))
+        await self._send_paced_rtp_payloads(state, [(payload, 1)], timestamp, media_time, max(duration_seconds, 0.0))
 
-    async def _send_raw_audio_packet(self, state: StreamTrackState, data: bytes, packet_time: float, duration_seconds: float) -> None:
-        source_time = self._relative_source_time(state, packet_time)
-        timestamp = int(round(source_time * state.info.clock_rate))
+    async def _send_raw_audio_packet(self, state: StreamTrackState, data: bytes, media_time: float, duration_seconds: float) -> None:
+        timestamp = int(round(media_time * state.info.clock_rate))
         self._log_first_frame(state, timestamp, len(data))
-        await self._send_paced_rtp_payloads(state, [(data, 1)], timestamp, source_time, max(duration_seconds, 0.0))
+        await self._send_paced_rtp_payloads(state, [(data, 1)], timestamp, media_time, max(duration_seconds, 0.0))
+
+    async def _send_wav_audio_packet(self, state: StreamTrackState, data: bytes, sample_cursor: int) -> None:
+        self._log_first_frame(state, sample_cursor, len(data))
+        media_time = sample_cursor / float(state.info.clock_rate or 1)
+        await self._sleep_until_media_time(state, media_time)
+        await self._send_rtp_packet(state, data, timestamp=sample_cursor, marker=1)
 
     def _relative_source_time(self, state: StreamTrackState, value: float) -> float:
         if state.first_source_time is None:
@@ -848,8 +1203,16 @@ class RtspServerSession:
             state.ssrc & 0xFFFFFFFF,
         )
         state.sequence_number = (state.sequence_number + 1) & 0xFFFF
+        state.packet_count += 1
+        state.octet_count += len(payload)
+        state.last_rtp_timestamp = timestamp & 0xFFFFFFFF
+        state.last_rtp_send_time = time.time()
         packet = header + payload
-        interleaved = b"$" + bytes([state.rtp_channel]) + struct.pack("!H", len(packet)) + packet
+        await self._send_interleaved_frame(state.rtp_channel, packet)
+        await self._maybe_send_rtcp_sr(state)
+
+    async def _send_interleaved_frame(self, channel: int, payload: bytes) -> None:
+        interleaved = b"$" + bytes([channel]) + struct.pack("!H", len(payload)) + payload
         async with self.write_lock:
             try:
                 await self.sock.send(interleaved)
@@ -857,6 +1220,91 @@ class RtspServerSession:
                 if _is_disconnect_error(ex):
                     raise ConnectionResetError(*getattr(ex, "args", ())) from ex
                 raise
+
+    async def _maybe_send_rtcp_sr(self, state: StreamTrackState) -> None:
+        if state.rtcp_channel is None or state.packet_count <= 0 or state.last_rtp_send_time is None:
+            return
+        now = time.time()
+        if state.last_rtcp_send_time is not None and now - state.last_rtcp_send_time < 5.0:
+            return
+        ntp_seconds = now + 2208988800
+        ntp_msw = int(ntp_seconds) & 0xFFFFFFFF
+        ntp_lsw = int((ntp_seconds - int(ntp_seconds)) * (1 << 32)) & 0xFFFFFFFF
+        packet = struct.pack(
+            "!BBHIIIIII",
+            0x80,
+            200,
+            6,
+            state.ssrc & 0xFFFFFFFF,
+            ntp_msw,
+            ntp_lsw,
+            state.last_rtp_timestamp & 0xFFFFFFFF,
+            state.packet_count & 0xFFFFFFFF,
+            state.octet_count & 0xFFFFFFFF,
+        )
+        await self._send_interleaved_frame(state.rtcp_channel, packet)
+        state.last_rtcp_send_time = now
+        logger.debug(
+            f"{self.peername} sent rtcp sr track={state.info.control} "
+            f"rtcp_channel={state.rtcp_channel} packets={state.packet_count} octets={state.octet_count} "
+            f"rtp_timestamp={state.last_rtp_timestamp}"
+        )
+
+    async def _send_rtcp_bye(self) -> None:
+        for state in self.track_states.values():
+            if state.rtcp_channel is None:
+                continue
+            packet = struct.pack(
+                "!BBHI",
+                0x81,
+                203,
+                1,
+                state.ssrc & 0xFFFFFFFF,
+            )
+            logger.info(
+                f"{self.peername} sent rtcp bye track={state.info.control} "
+                f"rtcp_channel={state.rtcp_channel} ssrc={state.ssrc:#x}"
+            )
+            with contextlib.suppress(Exception):
+                await self._send_interleaved_frame(state.rtcp_channel, packet)
+
+    def _handle_interleaved_frame(self, channel: int, payload: bytes) -> None:
+        if not payload:
+            return
+        self._mark_activity()
+        state = next((item for item in self.track_states.values() if item.rtcp_channel == channel), None)
+        if state is None:
+            return
+        self._handle_rtcp_packet(state, payload)
+
+    def _handle_rtcp_packet(self, state: StreamTrackState, payload: bytes) -> None:
+        offset = 0
+        while offset + 4 <= len(payload):
+            v_p_count, packet_type, length_words = struct.unpack_from("!BBH", payload, offset)
+            version = (v_p_count >> 6) & 0x03
+            if version != 2:
+                return
+            packet_size = (length_words + 1) * 4
+            if offset + packet_size > len(payload):
+                return
+            body = payload[offset + 4:offset + packet_size]
+            if packet_type == 201 and len(body) >= 20:
+                sender_ssrc, reportee_ssrc = struct.unpack_from("!II", body, 0)
+                fraction_lost = body[8]
+                highest_seq = struct.unpack_from("!I", body, 12)[0]
+                jitter = struct.unpack_from("!I", body, 16)[0]
+                logger.info(
+                    f"{self.peername} rtcp rr track={state.info.control} "
+                    f"sender_ssrc={sender_ssrc:#x} reportee_ssrc={reportee_ssrc:#x} "
+                    f"fraction_lost={fraction_lost} highest_seq={highest_seq} jitter={jitter}"
+                )
+            elif packet_type == 202 and len(body) >= 4:
+                source_ssrc = struct.unpack_from("!I", body, 0)[0]
+                logger.info(f"{self.peername} rtcp sdes track={state.info.control} ssrc={source_ssrc:#x}")
+            elif packet_type == 203 and len(body) >= 4:
+                source_ssrc = struct.unpack_from("!I", body, 0)[0]
+                logger.info(f"{self.peername} rtcp bye track={state.info.control} ssrc={source_ssrc:#x}")
+            offset += packet_size
 
     async def _send_response(
         self,
@@ -867,7 +1315,7 @@ class RtspServerSession:
         body: bytes = b"",
     ) -> None:
         headers = {
-            "CSeq": req_headers.get("CSeq", "0"),
+            "CSeq": req_headers.get("cseq", "0"),
             "Date": format_date_header(),
             "Server": DEFAULT_USER_AGENT,
         }
@@ -890,16 +1338,28 @@ class RtspServerSession:
 
 
 class RtspServer:
-    def __init__(self, directory: str, host: str = "0.0.0.0", port: int = 8554, session_name: str = "aio-rtsp-toolkit server"):
+    def __init__(
+        self,
+        directory: str,
+        host: str = "0.0.0.0",
+        port: int = 8554,
+        session_name: str = "aio-rtsp-toolkit server",
+        session_timeout: int = 60,
+    ):
         self.root_dir = Path(directory).expanduser().resolve()
         self.host = host
         self.port = port
         self.session_name = session_name
+        self.session_timeout = max(15, int(session_timeout))
         self._server: Optional[asyncio.AbstractServer] = None
+        self._media_source_cache: Dict[Tuple[Path, int, int], MediaSource] = {}
 
     async def start(self) -> "RtspServer":
         self._server = await aio.start_tcp_server(self._handle_client, self.host, self.port)
-        logger.info(f"RTSP server listening on {self.host}:{self.port}, dir={self.root_dir}")
+        logger.info(
+            f"RTSP server listening on {self.host}:{self.port}, dir={self.root_dir}, "
+            f"session_timeout={self.session_timeout}s"
+        )
         return self
 
     async def serve_forever(self) -> None:
@@ -936,13 +1396,14 @@ class RtspServer:
 
     def resolve_track_name(self, uri: str) -> str:
         parsed = urllib.parse.urlsplit(uri)
-        return parsed.path.rstrip("/").split("/")[-1]
+        track_name = parsed.path.rstrip("/").split("/")[-1]
+        return track_name.split(";", 1)[0]
 
     def build_content_base(self, uri: str, headers: Dict[str, str]) -> str:
         parsed = urllib.parse.urlsplit(uri)
         netloc = parsed.netloc.rsplit("@", 1)[-1]
         if not netloc:
-            host_header = headers.get("Host")
+            host_header = headers.get("host")
             if host_header:
                 netloc = host_header
             else:
@@ -955,12 +1416,14 @@ class RtspServer:
     def parse_play_count(self, uri: str) -> int:
         parsed = urllib.parse.urlsplit(uri)
         params = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
-        value = params.get("play_count", ["0"])[0].strip()
+        if "play_count" not in params:
+            return 1
+        value = params.get("play_count", ["1"])[0].strip()
         if not value:
-            return 0
+            return 1
         play_count = int(value)
         if play_count < 0:
-            raise ValueError("play_count must be greater than or equal to 0")
+            return 1
         return play_count
 
     def parse_interleaved_channels(self, transport: str) -> Optional[Tuple[int, int]]:
@@ -972,14 +1435,25 @@ class RtspServer:
                 value = part.split("=", 1)[1]
                 left, _, right = value.partition("-")
                 if left.isdigit() and right.isdigit():
-                    return int(left), int(right)
+                    channels = (int(left), int(right))
+                    if all(0 <= channel <= 255 for channel in channels):
+                        return channels
+                    raise ValueError("interleaved channel must be between 0 and 255")
         return None
 
     def load_media_source(self, file_path: Path) -> MediaSource:
+        stat = file_path.stat()
+        cache_key = (file_path, stat.st_mtime_ns, stat.st_size)
+        cached = self._media_source_cache.get(cache_key)
+        if cached is not None:
+            return cached
         suffix = file_path.suffix.lower()
         if suffix == ".wav":
-            return self._load_wav_source(file_path)
-        return self._load_av_source(file_path)
+            media_source = self._load_wav_source(file_path)
+        else:
+            media_source = self._load_av_source(file_path)
+        self._media_source_cache = {cache_key: media_source}
+        return media_source
 
     def _load_wav_source(self, file_path: Path) -> MediaSource:
         with av.open(str(file_path), mode="r") as container:
@@ -1096,8 +1570,8 @@ class RtspServer:
         return MediaSource(file_path=file_path, tracks=tracks, session_name=self.session_name)
 
 
-async def serve(directory: str, host: str = "0.0.0.0", port: int = 8554) -> None:
-    server = RtspServer(directory=directory, host=host, port=port)
+async def serve(directory: str, host: str = "0.0.0.0", port: int = 8554, session_timeout: int = 60) -> None:
+    server = RtspServer(directory=directory, host=host, port=port, session_timeout=session_timeout)
     try:
         await server.serve_forever()
     finally:

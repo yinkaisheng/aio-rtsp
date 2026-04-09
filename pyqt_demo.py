@@ -11,6 +11,7 @@ import av
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 import aio_sockets as aio
+import aio_rtsp_toolkit
 import aio_rtsp_toolkit as aiortsp
 from aio_rtsp_toolkit import (
     AudioFrameEvent,
@@ -20,13 +21,17 @@ from aio_rtsp_toolkit import (
     RtpPacketEvent,
     Tick,
     VideoFrameEvent,
+    audio_playback,
     open_session,
 )
-from aio_rtsp_toolkit.audio_playback import SoundDeviceAudioPlayer
 from log_util import logger, config_logger
 
 
 aiortsp.client.logger = logger
+audio_playback.logger = logger
+
+DEFAULT_SESSION_ID = "qt01"
+DEFAULT_LOG_PREFIX = "pyqt"
 
 
 class VideoLabel(QtWidgets.QLabel):
@@ -67,6 +72,7 @@ class RtspPlayerThread(QtCore.QThread):
     first_media_frame = QtCore.pyqtSignal()
 
     def __init__(self, rtsp_url: str, timeout: int, enable_video: bool = True, enable_audio: bool = True,
+                 session_id: str = DEFAULT_SESSION_ID, log_prefix: str = DEFAULT_LOG_PREFIX,
                  parent: Optional[QtCore.QObject] = None):
         super().__init__(parent)
         self.rtsp_url = rtsp_url
@@ -74,6 +80,8 @@ class RtspPlayerThread(QtCore.QThread):
         self.enable_video = enable_video
         self.enable_audio = enable_audio
         self.stop_event = threading.Event()
+        self.session_id = session_id
+        self.log_prefix = log_prefix
 
     def stop(self) -> None:
         self.stop_event.set()
@@ -102,7 +110,10 @@ class RtspPlayerThread(QtCore.QThread):
         th.start()
 
         codec: Optional[av.codec.context.CodecContext] = None
-        audio_player = SoundDeviceAudioPlayer()
+        audio_player = audio_playback.SoundDeviceAudioPlayer(
+            session_id=self.session_id,
+            log_prefix=self.log_prefix,
+        )
         timestamps: List[int] = []
         is_key_frame = {}
         is_corrupt_frame = {}
@@ -210,6 +221,7 @@ class RtspPlayerThread(QtCore.QThread):
                                     started_media_timer = True
                                 self.log_ready.emit(
                                     f"{Tick.process_tick()} first video frame: width={width}, height={height}"
+                                    f", session_elapsed={event.session_elapsed}s"
                                 )
                                 logged_first_video_frame = True
                             bytes_per_line = width * 3
@@ -228,7 +240,8 @@ class RtspPlayerThread(QtCore.QThread):
                         if aframe.sample_rate:
                             duration_ms = aframe.sample_count * 1000.0 / aframe.sample_rate
                         self.log_ready.emit(
-                            f"{Tick.process_tick()} first audio frame: sample_rate={aframe.sample_rate}, duration_ms={duration_ms:.2f}"
+                            f"{Tick.process_tick()} first audio frame: sample_rate={aframe.sample_rate}"
+                            f", duration_ms={duration_ms:.2f}, session_elapsed={event.session_elapsed}s"
                         )
                         logged_first_audio_frame = True
                     audio_player.feed(aframe)
@@ -240,19 +253,22 @@ class RtspPlayerThread(QtCore.QThread):
 
                 elif isinstance(event, aiortsp.RtspTimeoutError):
                     self.log_ready.emit(f'{Tick.process_tick()} rtsp timeout: {event!r}'
-                                        f'\n{"".join(traceback.format_exception(type(event), event, event.__traceback__))}')
+                                        f'\n{"".join(traceback.format_exception(type(event), event, event.__traceback__))}'
+                                        'the above exception was handled')
                     self.clear_video.emit()
                     break
 
                 elif isinstance(event, aiortsp.RtspConnectionError):
                     self.log_ready.emit(f'{Tick.process_tick()} rtsp connection error: {event!r}'
-                                        f'\n{"".join(traceback.format_exception(type(event), event, event.__traceback__))}')
+                                        f'\n{"".join(traceback.format_exception(type(event), event, event.__traceback__))}'
+                                        'the above exception was handled')
                     self.clear_video.emit()
                     break
 
                 elif isinstance(event, Exception):
                     self.log_ready.emit(f'{Tick.process_tick()} other exception: {event!r}'
-                                        f'\n{"".join(traceback.format_exception(type(event), event, event.__traceback__))}')
+                                        f'\n{"".join(traceback.format_exception(type(event), event, event.__traceback__))}'
+                                        'the above exception was handled')
                     self.clear_video.emit()
                     break
         finally:
@@ -267,6 +283,8 @@ class RtspPlayerThread(QtCore.QThread):
             enable_video=self.enable_video,
             enable_audio=self.enable_audio,
             log_type=aiortsp.DEFAULT_LOG_TYPE,
+            session_id=self.session_id,
+            log_prefix=self.log_prefix,
         ) as session:
             async for event in session.iter_events(self.stop_event):
                 if isinstance(event, RtpPacketEvent):
@@ -288,6 +306,7 @@ class MainWindow(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
         self.player_thread: Optional[RtspPlayerThread] = None
+        self.play_sequence = 0
         self._build_ui()
         self._load_last_rtsp_url()
 
@@ -374,12 +393,16 @@ class MainWindow(QtWidgets.QWidget):
         self.append_log(
             f"start play: url={rtsp_url}, timeout={self.timeout_spin.value()}s, media={'+'.join(media_mode)}"
         )
+        self.play_sequence += 1
+        session_id = f"qt{self.play_sequence:02d}"
 
         self.player_thread = RtspPlayerThread(
             rtsp_url,
             self.timeout_spin.value(),
             enable_video=self.video_check.isChecked(),
             enable_audio=self.audio_check.isChecked(),
+            session_id=session_id,
+            log_prefix=DEFAULT_LOG_PREFIX,
             parent=self,
         )
         self.player_thread.image_ready.connect(self.video_label.set_frame)

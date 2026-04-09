@@ -885,6 +885,7 @@ class RtspClient:
         self.sdp: Dict[str, Any] = {}
         self.cseq = 1
         self.session: str = ''
+        self.session_timeout: float = 0.0
         #: Interleaved channel numbers for RTSP-over-TCP transport.
         self.video_rtp_channel = 0
         self.video_rtcp_channel = 1
@@ -906,6 +907,22 @@ class RtspClient:
         self.video_splicer: VideoSplicer = None
         self.audio_splicer: AudioSplicer = None
         self.rtps_before_play_response: List[Tuple[int, RTP]] = []
+
+    def _update_session_from_header(self, session_header: str) -> None:
+        if not session_header:
+            return
+        parts = [part.strip() for part in str(session_header).split(';') if part.strip()]
+        if not parts:
+            return
+        self.session = parts[0]
+        for part in parts[1:]:
+            key, _, value = part.partition('=')
+            if key.strip().lower() != 'timeout':
+                continue
+            try:
+                self.session_timeout = float(value.strip())
+            except ValueError:
+                pass
 
     async def connect(self) -> bool:
         """Open the RTSP TCP connection."""
@@ -1125,7 +1142,7 @@ a=control:track3
                 logger.info(f'{self.log_tag} recv:\nstatus code: {rtsp_resp.status_code}'
                     f'\nheaders: {rtsp_resp.headers}'
                     f'\nbody: {rtsp_resp.body}')
-            self.session = rtsp_resp.headers.get('Session', self.session).split(';')[0]
+            self._update_session_from_header(rtsp_resp.headers.get('Session', self.session))
         audio_sdp = self.sdp.get('audio', None)
         if audio_sdp and audio:
             self.cseq += 1
@@ -1146,7 +1163,7 @@ a=control:track3
                 logger.info(f'{self.log_tag} recv:\nstatus code: {rtsp_resp.status_code}'
                     f'\nheaders: {rtsp_resp.headers}'
                     f'\nbody: {rtsp_resp.body}')
-            self.session = rtsp_resp.headers.get('Session', self.session).split(';')[0]
+            self._update_session_from_header(rtsp_resp.headers.get('Session', self.session))
         return rtsp_rtsps
 
     async def play(self) -> RtspResponse:
@@ -1181,6 +1198,45 @@ a=control:track3
             logger.info(f'{self.log_tag} recv:\nstatus code: {rtsp_resp.status_code}'
                 f'\nheaders: {rtsp_resp.headers}'
                 f'\nbody: {rtsp_resp.body}')
+        self._update_session_from_header(rtsp_resp.headers.get('Session', self.session))
+        return rtsp_resp
+
+    async def get_parameter(self) -> RtspResponse:
+        return await self._send_keepalive_request('GET_PARAMETER', include_session=True)
+
+    async def options_keepalive(self) -> RtspResponse:
+        return await self._send_keepalive_request('OPTIONS', include_session=False)
+
+    async def _send_keepalive_request(self, method: str, include_session: bool) -> RtspResponse:
+        auth_header = self.generate_auth_header(method)
+        self.cseq += 1
+        content = f'{method} {self.url} {self.rtsp_version}\r\n' \
+            f'CSeq: {self.cseq}\r\n' \
+            f'User-Agent: {self.user_agent}'
+        if include_session and self.session:
+            content += f'\r\nSession: {self.session}'
+        content += f'{auth_header}\r\n\r\n'
+        if self.log_type & RtspClientMsgType.RTSP:
+            logger.debug(f'{self.log_tag} {content}')
+        self.tick.update()
+        await self.sock.send(content.encode('utf-8'))
+        rtps_before_response: List[Tuple[int, Optional[RTP]]] = []
+        while True:
+            ret = await self.try_get_rtp()
+            if isinstance(ret, int):
+                if ret == -1:
+                    break
+                await self.recv_some_to_buffer(timeout=self.timeout)
+                continue
+            rtps_before_response.append(ret)
+        rtsp_resp = await self.wait_rstp_respone(timeout=self.timeout)
+        rtsp_resp.elapsed = self.tick.since_last()
+        if self.log_type & RtspClientMsgType.RTSP:
+            logger.debug(f'{self.log_tag} recv:\nstatus code: {rtsp_resp.status_code}'
+                f'\nheaders: {rtsp_resp.headers}'
+                f'\nbody: {rtsp_resp.body}')
+        self._update_session_from_header(rtsp_resp.headers.get('Session', self.session))
+        rtsp_resp.rtps_before_response = rtps_before_response
         return rtsp_resp
 
     async def teardown(self, wait_response: bool = True) -> None:
@@ -1408,6 +1464,8 @@ class RtspSession:
         self.enable_audio = enable_audio
         self._client: Optional[RtspClient] = None
         self._closed = False
+        self._keepalive_interval = 0.0
+        self._next_keepalive_at = 0.0
 
     async def __aenter__(self) -> 'RtspSession':
         return self
@@ -1516,6 +1574,7 @@ class RtspSession:
             rtsp_resp = await self._run_method('PLAY', rtsp.play)
             yield self._new_method_event('PLAY', rtsp_resp)
             self._ensure_ok('PLAY', rtsp_resp)
+            self._configure_keepalive()
 
             if rtsp.rtps_before_play_response:
                 logger.info(f'{self.log_tag} got {len(rtsp.rtps_before_play_response)} rtp packets before play response')
@@ -1557,6 +1616,72 @@ class RtspSession:
                 session_elapsed=self._client.tick.since_start(),
             ) from ex
 
+    def _configure_keepalive(self) -> None:
+        rtsp = self._client
+        timeout = float(getattr(rtsp, 'session_timeout', 0) or 0)
+        if timeout <= 0:
+            self._keepalive_interval = 0.0
+            self._next_keepalive_at = 0.0
+            return
+        self._keepalive_interval = max(5.0, min(timeout / 2.0, 30.0))
+        self._next_keepalive_at = time.monotonic() + self._keepalive_interval
+        if self.log_type & RtspClientMsgType.RTSP:
+            logger.debug(
+                f'{self.log_tag} keepalive enabled: session_timeout={timeout:.0f}s, '
+                f'interval={self._keepalive_interval:.1f}s'
+            )
+
+    async def _run_keepalive(self) -> AsyncGenerator[RtspEvent, None]:
+        if self.log_type & RtspClientMsgType.RTSP:
+            logger.debug(
+                f'{self.log_tag} keepalive send: method=GET_PARAMETER, session={self._client.session}, '
+                f'interval={self._keepalive_interval:.1f}s'
+            )
+        rtsp_resp = await self._run_method('GET_PARAMETER', self._client.get_parameter)
+        if rtsp_resp.status_code == 405:
+            if self.log_type & RtspClientMsgType.RTSP:
+                logger.debug(f'{self.log_tag} keepalive fallback: GET_PARAMETER not allowed, retry with OPTIONS')
+            rtsp_resp = await self._run_method('OPTIONS', self._client.options_keepalive)
+            keepalive_method = 'OPTIONS'
+        else:
+            keepalive_method = 'GET_PARAMETER'
+        self._ensure_ok(keepalive_method, rtsp_resp)
+        if self.log_type & RtspClientMsgType.RTSP:
+            logger.debug(
+                f'{self.log_tag} keepalive ok: method={keepalive_method}, status={rtsp_resp.status_code}, '
+                f'elapsed={rtsp_resp.elapsed:.3f}s'
+            )
+        self._configure_keepalive()
+        for channel, rtp in getattr(rtsp_resp, 'rtps_before_response', []):
+            if rtp is None:
+                yield self._new_rtp_event(channel, rtp)
+                continue
+            rtp.recv_tick = Tick.process_tick()
+            yield self._new_rtp_event(channel, rtp)
+            if self.enable_video and channel == self._client.video_rtp_channel:
+                for vframe in self._client.video_splicer.try_get_video_frame(rtp):
+                    if self._client.log_type & RtspClientMsgType.VideoFrame:
+                        logger.info(f'{self.log_tag} {vframe}')
+                    yield VideoFrameEvent(
+                        event='video_frame',
+                        msg_type=RtspClientMsgType.VideoFrame,
+                        session_elapsed=self._client.tick.since_start(),
+                        frame=vframe,
+                    )
+                self._client.shrink_buffer()
+            elif self.enable_audio and channel == self._client.audio_rtp_channel:
+                if self._client.audio_splicer:
+                    for aframe in self._client.audio_splicer.try_get_audio_frames(rtp):
+                        if self._client.log_type & RtspClientMsgType.AudioFrame:
+                            logger.info(f'{self.log_tag} {aframe}')
+                        yield AudioFrameEvent(
+                            event='audio_frame',
+                            msg_type=RtspClientMsgType.AudioFrame,
+                            session_elapsed=self._client.tick.since_start(),
+                            frame=aframe,
+                        )
+                self._client.shrink_buffer()
+
     def _new_method_event(self, method: str, response: RtspResponse, media_type: Optional[str] = None) -> RtspMethodEvent:
         return RtspMethodEvent(
             event='rtsp_method',
@@ -1594,6 +1719,9 @@ class RtspSession:
         rtsp = self._client
         start_tick = time.perf_counter()
         while True:
+            if max_time <= 0 and self._keepalive_interval > 0 and time.monotonic() >= self._next_keepalive_at:
+                async for event in self._run_keepalive():
+                    yield event
             try:
                 ret = await rtsp.try_get_rtp()
             except Exception as ex:

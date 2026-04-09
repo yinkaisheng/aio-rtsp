@@ -30,6 +30,7 @@ class SoundDeviceAudioPlayer(AudioPCMDecoder):
         self.pending_chunk = None
         self.pending_offset = 0
         self.queue_lock = threading.Lock()
+        self.logged_first_playback_frame = False
 
     def feed(self, audio_frame) -> List[PCMFrame]:
         pcm_frames = super().feed(audio_frame)
@@ -38,6 +39,14 @@ class SoundDeviceAudioPlayer(AudioPCMDecoder):
             if pcm.size == 0:
                 continue
             pcm = normalize_audio_array(pcm, pcm_frame.channels)
+            if not self.logged_first_playback_frame:
+                self.logged_first_playback_frame = True
+                duration_ms = pcm_frame.samples_per_channel * 1000.0 / float(pcm_frame.sample_rate or 1)
+                logger.info(
+                    f'{self.log_tag}{Tick.process_tick()} First playback PCM frame: '
+                    f'sample_rate={pcm_frame.sample_rate}, channels={pcm_frame.channels}, '
+                    f'samples_per_channel={pcm_frame.samples_per_channel}, duration_ms={duration_ms:.2f}'
+                )
             self._ensure_output(pcm_frame.sample_rate, pcm_frame.channels)
             self._enqueue_pcm(pcm)
         return pcm_frames
@@ -67,6 +76,7 @@ class SoundDeviceAudioPlayer(AudioPCMDecoder):
                 except queue.Empty:
                     break
         self._close_output()
+        self.logged_first_playback_frame = False
         super().close()
 
     def _enqueue_pcm(self, pcm) -> None:

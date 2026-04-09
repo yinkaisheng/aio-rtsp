@@ -109,15 +109,17 @@ def pyav_play(rtsp_url: str, forward_address: aio.IPAddress, play_time: int, tim
 
     codec: av.codec.CodecContext = None #av.CodecContext.create("h264", "r")
     if audio_mode == 'play':
-        from aio_rtsp_toolkit.audio_playback import SoundDeviceAudioPlayer
-        audio_handler = SoundDeviceAudioPlayer(
+        from aio_rtsp_toolkit import audio_playback
+        audio_playback.logger = logger
+        audio_handler = audio_playback.SoundDeviceAudioPlayer(
             output_sample_rate=audio_output_sample_rate,
             session_id=session_id,
             log_prefix=log_prefix,
         )
     else:
-        from aio_rtsp_toolkit.audio_decode import AudioPCMDecoder
-        audio_handler = AudioPCMDecoder(
+        from aio_rtsp_toolkit import audio_decode
+        audio_decode.logger = logger
+        audio_handler = audio_decode.AudioPCMDecoder(
             output_sample_rate=audio_output_sample_rate,
             session_id=session_id,
             log_prefix=log_prefix,
@@ -269,28 +271,31 @@ def pyav_play(rtsp_url: str, forward_address: aio.IPAddress, play_time: int, tim
                 for pcm_frame in pcm_frames:
                     if audio_saver:
                         audio_saver.write(pcm_frame)
-                    if audio_mode == 'decode':
-                         if first_decoded_tick == 0:
-                            first_decoded_tick = Tick.process_tick()
-                        # logger.info(f'  {Tick.process_tick()} pcm samples={pcm_frame.samples_per_channel}, '
-                        #     f'sample_rate={pcm_frame.sample_rate}, channels={pcm_frame.channels}, '
-                        #     f'bytes={len(pcm_frame.pcm_bytes)}')
+                    if first_decoded_tick == 0:
+                        first_decoded_tick = Tick.process_tick()
+                    # logger.info(f'  {Tick.process_tick()} pcm samples={pcm_frame.samples_per_channel}, '
+                    #     f'sample_rate={pcm_frame.sample_rate}, channels={pcm_frame.channels}, '
+                    #     f'bytes={len(pcm_frame.pcm_bytes)}')
             elif isinstance(event, ClosedEvent):
                 logger.info(f'{Tick.process_tick()} {Fore.Green}RtspClientMsgType.Closed{Fore.Reset} session_elapsed={event.session_elapsed}')
                 break
             elif isinstance(event, aiortsp.RtspTimeoutError):
                 logger.error(f'{Tick.process_tick()} {Fore.Red}rtsp timeout{Fore.Reset}: {event!r} session_elapsed={event.session_elapsed}'
-                    f'\n{"".join(traceback.format_exception(type(event), event, event.__traceback__))}')
+                    f'\n{"".join(traceback.format_exception(type(event), event, event.__traceback__))}'
+                    'the above exception was handled')
                 break
             elif isinstance(event, aiortsp.RtspConnectionError):
                 logger.error(f'{Tick.process_tick()} {Fore.Red}rtsp connection error{Fore.Reset}: {event!r} session_elapsed={event.session_elapsed}'
-                    f'\n{"".join(traceback.format_exception(type(event), event, event.__traceback__))}')
+                    f'\n{"".join(traceback.format_exception(type(event), event, event.__traceback__))}'
+                    'the above exception was handled')
                 break
             elif isinstance(event, Exception):
                 logger.error(f'{Tick.process_tick()} {Fore.Red}other exception{Fore.Reset}: {event!r}'
-                    f'\n{"".join(traceback.format_exception(type(event), event, event.__traceback__))}')
+                    f'\n{"".join(traceback.format_exception(type(event), event, event.__traceback__))}'
+                    'the above exception was handled')
                 break
-            if first_decoded_tick > 0 and Tick.process_tick() - first_decoded_tick >= play_time:
+            stream_time = Tick.process_tick() - first_decoded_tick
+            if first_decoded_tick > 0 and stream_time >= play_time:
                 if not stop_event.is_set():
                     logger.info(f'{Tick.process_tick()} {Fore.Cyan}trigger stop{Fore.Reset}, first_decoded_tick={first_decoded_tick}')
                     stop_event.set()
@@ -342,9 +347,9 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
     parser.add_argument('-u', '--url', help='rtsp url')
-    parser.add_argument('-f', '--forward', default='', help='forward address')
-    parser.add_argument('-t', '--time', type=int, default=5, help='play time')
-    parser.add_argument('-to', '--timeout', type=int, default=5, help='timeout')
+    parser.add_argument('-f', '--forward', default='', help='forward address[default: disabled], e.g. 127.0.0.1:8080')
+    parser.add_argument('-t', '--time', type=int, default=5, help='play time[default: 5]')
+    parser.add_argument('-to', '--timeout', type=int, default=5, help='timeout[default: 5]')
     parser.add_argument('--audio-mode', choices=('decode', 'play'), default=AUDIO_MODE,
                         help=f'audio handling mode, default: {AUDIO_MODE}')
     parser.add_argument('--audio-rate', type=int, default=AUDIO_OUTPUT_SAMPLE_RATE,
@@ -364,6 +369,7 @@ if __name__ == '__main__':
         forward_addr = (args.forward[:index], int(args.forward[index+1:]))
 
     config_logger(logger, 'info', log_dir='logs', log_file='cli_demo.log')
+    logger.info(args)
     pyav_play(
         args.url,
         forward_addr,

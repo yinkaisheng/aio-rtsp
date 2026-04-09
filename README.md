@@ -108,6 +108,8 @@ Current server behavior:
 - Files are resolved relative to the configured root directory
 - Files outside the root are rejected
 - Unsupported codecs are skipped rather than transcoded
+- Session timeout negotiation is not implemented
+- The server sends minimal RTCP Sender Report and BYE packets for configured tracks
 
 ### Supported Inputs
 
@@ -133,7 +135,7 @@ rtsp://127.0.0.1:8554/zhongli.wav?play_count=0
 - `play_count=1`: play once, then close
 - `play_count=2`: play twice, then close
 - `play_count=0`: loop forever
-- omitted `play_count`: same as `0`
+- `play_count<0` or omitted `play_count`: play once, then close
 
 ## RTSP Client
 
