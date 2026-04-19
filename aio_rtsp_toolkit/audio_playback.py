@@ -2,21 +2,24 @@
 
 import queue
 import threading
-from typing import List, Optional
+from typing import Any, List, Optional
 
 import sounddevice as sd
 
+from . import types
 from .audio_decode import AudioPCMDecoder, PCMFrame, normalize_audio_array
-from .client import logger
 from .tick import Tick
 
 
 class SoundDeviceAudioPlayer(AudioPCMDecoder):
     """Decode PCM and play it through ``sounddevice``."""
 
-    def __init__(self, output_sample_rate: Optional[int] = None,
-                 session_id: Optional[str] = None,
-                 log_prefix: str = ''):
+    def __init__(
+        self,
+        output_sample_rate: Optional[int] = None,
+        session_id: Optional[str] = None,
+        log_prefix: str = '',
+    ) -> None:
         super().__init__(
             output_sample_rate=output_sample_rate,
             session_id=session_id,
@@ -26,13 +29,13 @@ class SoundDeviceAudioPlayer(AudioPCMDecoder):
         self.output_stream = None
         self.active_output_sample_rate = 0
         self.active_output_channels = 0
-        self.pcm_queue: queue.Queue = queue.Queue(maxsize=128)
+        self.pcm_queue = queue.Queue(maxsize=128)  # type: queue.Queue[Any]
         self.pending_chunk = None
         self.pending_offset = 0
         self.queue_lock = threading.Lock()
         self.logged_first_playback_frame = False
 
-    def feed(self, audio_frame) -> List[PCMFrame]:
+    def feed(self, audio_frame: Any) -> List[PCMFrame]:
         pcm_frames = super().feed(audio_frame)
         for pcm_frame in pcm_frames:
             pcm = self.numpy.frombuffer(pcm_frame.pcm_bytes, dtype=self.numpy.int16)
@@ -42,7 +45,7 @@ class SoundDeviceAudioPlayer(AudioPCMDecoder):
             if not self.logged_first_playback_frame:
                 self.logged_first_playback_frame = True
                 duration_ms = pcm_frame.samples_per_channel * 1000.0 / float(pcm_frame.sample_rate or 1)
-                logger.info(
+                types.logger.info(
                     f'{self.log_tag}{Tick.process_tick()} First playback PCM frame: '
                     f'sample_rate={pcm_frame.sample_rate}, channels={pcm_frame.channels}, '
                     f'samples_per_channel={pcm_frame.samples_per_channel}, duration_ms={duration_ms:.2f}'
@@ -79,7 +82,7 @@ class SoundDeviceAudioPlayer(AudioPCMDecoder):
         self.logged_first_playback_frame = False
         super().close()
 
-    def _enqueue_pcm(self, pcm) -> None:
+    def _enqueue_pcm(self, pcm: Any) -> None:
         if pcm.size == 0:
             return
         chunk = self.numpy.ascontiguousarray(pcm)
@@ -93,9 +96,9 @@ class SoundDeviceAudioPlayer(AudioPCMDecoder):
                 except queue.Empty:
                     return
 
-    def _audio_callback(self, outdata, frames, time_info, status) -> None:
+    def _audio_callback(self, outdata: Any, frames: int, time_info: Any, status: Any) -> None:
         if status:
-            logger.warning(f'{self.log_tag}{Tick.process_tick()} Audio callback status: {status}')
+            types.logger.warning(f'{self.log_tag}{Tick.process_tick()} Audio callback status: {status}')
         outdata.fill(0)
         frame_offset = 0
         channels = outdata.shape[1] if outdata.ndim == 2 else self.active_output_channels or 1

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aio-rtsp-toolkit"
-version = "0.1.1"
+version = "0.1.2"
 description = "Async RTSP client with protocol timing, RTP and frame events, plus a lightweight RTSP/TCP file server"
 readme = "README.md"
 authors = [{name = "yinkaisheng", email = "yinkaisheng@foxmail.com"}]
@@ -24,9 +24,17 @@ decode = ["numpy", "av"]
 audio = ["numpy", "sounddevice", "av"]
 all = ["numpy", "sounddevice", "av"]
 
+[project.scripts]
+rtsp-client-cli = "cli_demo:main"
+rtsp-client-pyqt5 = "pyqt_demo:main"
+rtsp-server = "server_demo:main"
+
 [project.urls]
 Homepage = "https://github.com/yinkaisheng/aio-rtsp"
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["aio_rtsp_toolkit"]
+
+[tool.setuptools]
+py-modules = ["cli_demo", "pyqt_demo", "server_demo", "log_util"]

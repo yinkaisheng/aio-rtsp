@@ -1,7 +1,5 @@
 """Audio codec helpers that do not depend on external media libraries."""
 
-from typing import Optional
-
 
 def decode_g711_alaw_byte(value: int) -> int:
     """Decode one G.711 A-law byte into a signed 16-bit PCM sample."""
@@ -44,4 +42,3 @@ def decode_g711_to_pcm16_bytes(data: bytes, is_alaw: bool) -> bytes:
         pcm[offset:offset + 2] = int(sample).to_bytes(2, byteorder='little', signed=True)
         offset += 2
     return bytes(pcm)
-

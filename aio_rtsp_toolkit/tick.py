@@ -2,26 +2,19 @@ import time
 
 
 class Tick:
-    """Monotonic timing helper used for local process-relative measurements.
-
-    All values produced by this class are process-local elapsed times derived
-    from ``time.perf_counter()``. They are not wall-clock timestamps and should
-    not be compared across different processes or machines.
-    """
+    """Monotonic timing helper used for local process-relative measurements."""
 
     get_tick = time.perf_counter
     _offset_tick = get_tick()
 
     @staticmethod
     def process_tick() -> float:
-        """Return seconds elapsed since this Python process initialized Tick."""
-
         return round(Tick.get_tick() - Tick._offset_tick, 6)
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.reset()
 
-    def reset(self):
+    def reset(self) -> None:
         self.start_tick = self.get_tick()
         self.last_tick = None
 
@@ -48,11 +41,11 @@ class Tick:
             return True
         return False
 
-    def reset_interval(self):
+    def reset_interval(self) -> None:
         self.last_tick = None
 
-    def __str__(self):
+    def __str__(self) -> str:
         return f'elapsed(last={self.since_last()},total={self.last_tick - self.start_tick})'
 
-    def __repr__(self):
-        return f'<{self.__class__.__name__} at 0x{id(self):08} {self}>'
+    def __repr__(self) -> str:
+        return f'<{self.__class__.__name__} at 0x{id(self):08x} {self}>'

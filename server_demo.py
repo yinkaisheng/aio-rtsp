@@ -4,28 +4,30 @@ import asyncio
 
 import aio_sockets as aio
 import aio_rtsp_toolkit as aiortsp
+import aio_rtsp_toolkit.server as server
 from log_util import logger, config_logger
 
 
-aiortsp.server.logger = logger
+aio.aio_sockets.logger = logger
+server.logger = logger
 
 
 def main() -> None:
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dir", required=True, help="Directory to publish recursively")
-    parser.add_argument("--host", default="0.0.0.0", help="Bind host")
-    parser.add_argument("--port", type=int, default=8554, help="Bind port")
+    parser.add_argument("-d", "--dir", required=True, help="Directory to publish recursively")
+    parser.add_argument("-H", "--host", default="0.0.0.0", help="Bind host[default 0.0.0.0]")
+    parser.add_argument("-p", "--port", type=int, default=8554, help="Bind port[default 8554]")
     args = parser.parse_args()
 
-    use_file_logger = 1
+    use_file_logger = 0
     if use_file_logger:
         config_logger(logger, 'info', log_dir='logs', log_file='rtsp_server.log')
     else:
         config_logger(logger, 'info')
 
-    asyncio.run(aiortsp.serve(args.dir, args.host, args.port))
+    asyncio.run(server.serve(args.dir, args.host, args.port))
 
 
 if __name__ == "__main__":

@@ -26,6 +26,14 @@ Base install:
 pip install aio-rtsp-toolkit
 ```
 
+This installs three command-line entry points:
+
+- `rtsp-client-cli`
+- `rtsp-client-pyqt5`
+- `rtsp-server`
+
+On Windows they are installed as `.exe` launchers in the active Python `Scripts` directory. On Linux and macOS they are installed into the active Python `bin` directory.
+
 Optional extras:
 
 ```shell
@@ -39,6 +47,15 @@ pip install aio-rtsp-toolkit[all]
 - `[decode]`: installs `numpy` and `av` for audio PCM decode helpers
 - `[audio]`: installs `numpy`, `sounddevice`, and `av` for audio playback helpers
 - `[all]`: installs all optional dependencies
+
+On Linux, audio playback also requires the system PortAudio runtime in addition to the Python `sounddevice` package. Without PortAudio, `rtsp-client-pyqt5` and `rtsp-client-cli --audio-mode play` will fail at runtime.
+
+On Ubuntu, install it with:
+
+```shell
+sudo apt update
+sudo apt install -y libportaudio2
+```
 
 ## Quick Start
 
@@ -76,7 +93,7 @@ asyncio.run(main())
 Publish a directory recursively:
 
 ```shell
-python server_demo.py --dir ./media --host 0.0.0.0 --port 8554
+rtsp-server --dir ./media --host 0.0.0.0 --port 8554
 ```
 
 Each file becomes an RTSP resource under the same relative path:
@@ -201,6 +218,7 @@ asyncio.run(main())
 - Install the `[decode]` extra for PCM decode only, or `[audio]` for decode + playback
 - G.711 A-law and mu-law playback do not require PyAV
 - AAC and AAC-LATM playback do require PyAV
+- On Linux, playback also requires the system PortAudio runtime
 
 ## Demos
 
@@ -209,11 +227,12 @@ asyncio.run(main())
 `pyqt_demo.py` shows how to consume `RtspSession` events, decode video with PyAV, and play audio with `sounddevice`.
 
 It also requires `PyQt5` in addition to the `[audio]` extra.
+On Linux it also requires the system PortAudio runtime.
 
 ![PyQt Demo](images/pyqt5demo.gif)
 
 ```shell
-python pyqt_demo.py
+rtsp-client-pyqt5
 ```
 
 ### CLI Demo
@@ -223,10 +242,10 @@ python pyqt_demo.py
 You can still change the source defaults in the script, but it now also supports runtime control:
 
 ```shell
-python cli_demo.py -u rtsp://127.0.0.1:8554/morning_h264.mp4
-python cli_demo.py -u rtsp://127.0.0.1:8554/morning_h264.mp4 --audio-mode decode --audio-rate 16000
-python cli_demo.py -u rtsp://127.0.0.1:8554/morning_h264.mp4 --save-audio ""
-python cli_demo.py -u rtsp://127.0.0.1:8554/morning_h264.mp4 --audio-mode play --audio-rate 16000 --session-id s01 --log-prefix cam01
+rtsp-client-cli -u rtsp://127.0.0.1:8554/morning_h264.mp4
+rtsp-client-cli -u rtsp://127.0.0.1:8554/morning_h264.mp4 --audio-mode decode --audio-rate 16000
+rtsp-client-cli -u rtsp://127.0.0.1:8554/morning_h264.mp4 --save-audio ""
+rtsp-client-cli -u rtsp://127.0.0.1:8554/morning_h264.mp4 --audio-mode play --audio-rate 16000 --session-id s01 --log-prefix cam01
 ```
 
 - `--audio-mode decode`: decode audio to PCM
@@ -239,9 +258,10 @@ python cli_demo.py -u rtsp://127.0.0.1:8554/morning_h264.mp4 --audio-mode play -
 - `--log-prefix cam01`: set the log prefix used by RTSP/audio logs
 
 Install the `[all]` extra for PyAV, then install `Pillow` if you want to save the first decoded frame as an image.
+On Linux, `--audio-mode play` also requires the system PortAudio runtime.
 
 ```shell
-python cli_demo.py -u rtsp://127.0.0.1:8554/morning_h264.mp4
+rtsp-client-cli -u rtsp://127.0.0.1:8554/morning_h264.mp4
 ```
 
 ## API Summary

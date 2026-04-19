@@ -7,9 +7,9 @@ from typing import Any, Dict, List, Optional, Tuple
 import av
 import numpy
 
+from . import types
 from .audio_codecs import decode_g711_to_pcm16_bytes
 from .tick import Tick
-from .client import logger
 
 
 def get_av_audio_codec_params(audio_sdp: Dict[str, Any]) -> Tuple[str, Optional[bytes]]:
@@ -20,12 +20,12 @@ def get_av_audio_codec_params(audio_sdp: Dict[str, Any]) -> Tuple[str, Optional[
     if isinstance(config, str) and config:
         config = config.strip()
         if len(config) % 2 == 1:
-            config = '0' + config
+            config = f'0{config}'
         extradata = bytes.fromhex(config)
     elif isinstance(config, int):
         hex_config = f'{config:X}'
         if len(hex_config) % 2 == 1:
-            hex_config = '0' + hex_config
+            hex_config = f'0{hex_config}'
         extradata = bytes.fromhex(hex_config)
 
     if codec_name_lower in ('pcma', 'g711a', 'g711-alaw'):
@@ -39,7 +39,7 @@ def get_av_audio_codec_params(audio_sdp: Dict[str, Any]) -> Tuple[str, Optional[
     return '', extradata
 
 
-def get_frame_channel_count(frame, fallback: int = 1) -> int:
+def get_frame_channel_count(frame: Any, fallback: int = 1) -> int:
     try:
         return len(frame.layout.channels)
     except Exception:
@@ -59,7 +59,7 @@ def get_frame_channel_count(frame, fallback: int = 1) -> int:
     return fallback
 
 
-def normalize_audio_array(arr, channel_count: int):
+def normalize_audio_array(arr: Any, channel_count: int) -> Any:
     if arr.ndim == 1:
         return arr.reshape(-1, channel_count)
     if arr.ndim == 2:
@@ -86,9 +86,12 @@ class PCMFrame:
 class AudioPCMDecoder:
     """Decode audio frames into PCM ``s16le`` chunks."""
 
-    def __init__(self, output_sample_rate: Optional[int] = None,
-                 session_id: Optional[str] = None,
-                 log_prefix: str = ''):
+    def __init__(
+        self,
+        output_sample_rate: Optional[int] = None,
+        session_id: Optional[str] = None,
+        log_prefix: str = '',
+    ) -> None:
         self.numpy = numpy
         self.session_id = session_id or ''
         self.log_prefix = log_prefix or ''
@@ -110,7 +113,7 @@ class AudioPCMDecoder:
         av_codec_name, extradata = get_av_audio_codec_params(audio_sdp)
         if not av_codec_name:
             codec_name = audio_sdp.get('codec_name', '')
-            logger.warning(f'{self.log_tag}{Tick.process_tick()} Audio codec is not supported for PCM decode: {codec_name}')
+            types.logger.warning(f'{self.log_tag}{Tick.process_tick()} Audio codec is not supported for PCM decode: {codec_name}')
             return False
         self.codec_name = av_codec_name
         self.source_codec_name = str(audio_sdp.get('codec_name', '')).lower()
@@ -124,13 +127,13 @@ class AudioPCMDecoder:
         self.channels = int(audio_sdp.get('channel', 1) or 1)
         self.time_base = fractions.Fraction(1, self.sample_rate)
         output_sample_rate = self.output_sample_rate or self.sample_rate
-        logger.info(
+        types.logger.info(
             f'{self.log_tag}{Tick.process_tick()} Audio ready: codec={audio_sdp.get("codec_name")}, decoder={av_codec_name}'
             f', sample_rate={self.sample_rate}, channels={self.channels}, output_sample_rate={output_sample_rate}'
         )
         return True
 
-    def feed(self, audio_frame) -> List[PCMFrame]:
+    def feed(self, audio_frame: Any) -> List[PCMFrame]:
         if not audio_frame.data:
             return []
 
@@ -147,10 +150,10 @@ class AudioPCMDecoder:
         try:
             decoded_frames = self.codec.decode(packet)
         except Exception as ex:
-            logger.error(f'{self.log_tag}{Tick.process_tick()} Audio decode error timestamp={audio_frame.timestamp}, ex={ex!r}')
+            types.logger.error(f'{self.log_tag}{Tick.process_tick()} Audio decode error timestamp={audio_frame.timestamp}, ex={ex!r}')
             return []
 
-        pcm_frames: List[PCMFrame] = []
+        pcm_frames = []  # type: List[PCMFrame]
         for decoded_frame in decoded_frames:
             pcm_frames.extend(self._decode_frame(decoded_frame))
         return pcm_frames
@@ -160,7 +163,7 @@ class AudioPCMDecoder:
             pcm_bytes = decode_g711_to_pcm16_bytes(data, is_alaw=is_alaw)
         except Exception as ex:
             codec_label = 'pcma' if is_alaw else 'pcmu'
-            logger.error(f'{self.log_tag}{Tick.process_tick()} Audio decode error codec={codec_label}, ex={ex!r}')
+            types.logger.error(f'{self.log_tag}{Tick.process_tick()} Audio decode error codec={codec_label}, ex={ex!r}')
             return []
 
         pcm = self.numpy.frombuffer(pcm_bytes, dtype=self.numpy.int16)
@@ -173,7 +176,7 @@ class AudioPCMDecoder:
             sample_rate = self.output_sample_rate
         return [self._pcm_frame_from_array(pcm, sample_rate, self.channels)]
 
-    def _decode_frame(self, decoded_frame) -> List[PCMFrame]:
+    def _decode_frame(self, decoded_frame: Any) -> List[PCMFrame]:
         sample_rate = decoded_frame.sample_rate or self.sample_rate or 8000
         channel_count = get_frame_channel_count(decoded_frame, self.channels)
         layout_name = getattr(decoded_frame.layout, 'name', None)
@@ -189,14 +192,14 @@ class AudioPCMDecoder:
         if not isinstance(resampled, list):
             resampled = [resampled]
 
-        pcm_frames: List[PCMFrame] = []
+        pcm_frames = []  # type: List[PCMFrame]
         for frame in resampled:
             frame_channels = get_frame_channel_count(frame, channel_count)
             pcm = normalize_audio_array(frame.to_ndarray(), frame_channels)
             pcm_frames.append(self._pcm_frame_from_array(pcm, frame.sample_rate or output_sample_rate, frame_channels))
         return pcm_frames
 
-    def _resample_pcm_array(self, pcm, sample_rate: int, channels: int, output_sample_rate: int):
+    def _resample_pcm_array(self, pcm: Any, sample_rate: int, channels: int, output_sample_rate: int) -> Any:
         layout_name = 'mono' if channels == 1 else 'stereo'
         resampler_key = (sample_rate, channels, layout_name, output_sample_rate, 'pcm-array')
         if self.resampler is None or self.resampler_key != resampler_key:
@@ -214,13 +217,13 @@ class AudioPCMDecoder:
             return self.numpy.empty((0, channels), dtype=self.numpy.int16)
         return self.numpy.ascontiguousarray(self.numpy.concatenate(arrays, axis=0))
 
-    def _pcm_frame_from_array(self, pcm, sample_rate: int, channels: int) -> PCMFrame:
+    def _pcm_frame_from_array(self, pcm: Any, sample_rate: int, channels: int) -> PCMFrame:
         pcm = self.numpy.ascontiguousarray(pcm, dtype=self.numpy.int16)
         samples_per_channel = int(pcm.shape[0]) if pcm.ndim >= 1 else 0
         if not self.logged_first_pcm_frame and samples_per_channel > 0:
             self.logged_first_pcm_frame = True
             duration_ms = samples_per_channel * 1000.0 / float(sample_rate or 1)
-            logger.info(
+            types.logger.info(
                 f'{self.log_tag}{Tick.process_tick()} First decoded audio PCM frame: '
                 f'codec={self.source_codec_name or self.codec_name}, sample_rate={sample_rate}, '
                 f'channels={channels}, samples_per_channel={samples_per_channel}, duration_ms={duration_ms:.2f}'
