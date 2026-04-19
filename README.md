@@ -107,11 +107,11 @@ Run the server from Python:
 
 ```python
 import asyncio
-import aio_rtsp_toolkit as aiortsp
+import aio_rtsp_toolkit.server as server
 
 
 async def main():
-    await aiortsp.serve("./media", host="0.0.0.0", port=8554)
+    await server.serve("./media", host="0.0.0.0", port=8554)
 
 
 asyncio.run(main())
