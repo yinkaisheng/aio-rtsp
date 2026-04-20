@@ -12,6 +12,7 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 
 import aio_sockets as aio
 import aio_rtsp_toolkit as aiortsp
+from aio_rtsp_toolkit.tick import Tick
 import aio_rtsp_toolkit.audio_decode as audio_decode
 import aio_rtsp_toolkit.audio_playback as audio_playback
 
@@ -89,7 +90,7 @@ class RtspPlayerThread(QtCore.QThread):
         try:
             self._play()
         except Exception as ex:
-            self.log_ready.emit(f'{aiortsp.Tick.process_tick()} playback thread error: {ex!r}\n{traceback.format_exc()}')
+            self.log_ready.emit(f'{Tick.process_tick():.3f} playback thread error: {ex!r}\n{traceback.format_exc()}')
         finally:
             self.playing_changed.emit(False)
 
@@ -128,12 +129,12 @@ class RtspPlayerThread(QtCore.QThread):
                 if isinstance(event, aiortsp.ConnectResultEvent):
                     if event.exception is None:
                         self.log_ready.emit(
-                            f'{aiortsp.Tick.process_tick()} RTSP connected, local addr={event.local_addr}, cost={event.elapsed}s'
+                            f'{Tick.process_tick():.3f} RTSP connected, local addr={event.local_addr}, cost={event.elapsed}s'
                             f', session_elapsed={event.session_elapsed}s'
                         )
                     else:
                         self.log_ready.emit(
-                            f'{aiortsp.Tick.process_tick()} RTSP connect failed, local addr={event.local_addr}, cost={event.elapsed}s'
+                            f'{Tick.process_tick():.3f} RTSP connect failed, local addr={event.local_addr}, cost={event.elapsed}s'
                             f', session_elapsed={event.session_elapsed}s'
                             f', ex={event.exception!r}'
                         )
@@ -149,7 +150,7 @@ class RtspPlayerThread(QtCore.QThread):
                         codec_name_lower = str(video_sdp.get('codec_name', '')).lower()
                         if video_sdp:
                             self.log_ready.emit(
-                                f'{aiortsp.Tick.process_tick()} video stream: codec={video_sdp.get("codec_name", "unknown")}, clock_rate={video_clock_rate}'
+                                f'{Tick.process_tick():.3f} video stream: codec={video_sdp.get("codec_name", "unknown")}, clock_rate={video_clock_rate}'
                             )
                         if codec_name_lower:
                             av_codec_name = aiortsp.HEVCCodecName if codec_name_lower == aiortsp.H265CodecName else codec_name_lower
@@ -161,7 +162,7 @@ class RtspPlayerThread(QtCore.QThread):
                         audio_sdp = (event.response.sdp or {}).get('audio', {})
                         if audio_sdp:
                             self.log_ready.emit(
-                                f'{aiortsp.Tick.process_tick()} audio stream: codec={audio_sdp.get("codec_name", "unknown")}, '
+                                f'{Tick.process_tick():.3f} audio stream: codec={audio_sdp.get("codec_name", "unknown")}, '
                                 f'sample_rate={audio_sdp.get("clock_rate", 0)}, channels={audio_sdp.get("channel", 1)}'
                             )
                             audio_player.configure(audio_sdp)
@@ -181,7 +182,7 @@ class RtspPlayerThread(QtCore.QThread):
                         if codec_name_lower in (aiortsp.H264CodecName, aiortsp.H265CodecName) and not vframe.is_key_frame:
                             continue
                         if is_corrupt_frame.get(vframe.timestamp, False):
-                            self.log_ready.emit(f'{aiortsp.Tick.process_tick()} skip corrupt raw frame ts={vframe.timestamp}')
+                            self.log_ready.emit(f'{Tick.process_tick():.3f} skip corrupt raw frame ts={vframe.timestamp}')
                             continue
 
                     if codec_name_lower in (aiortsp.H264CodecName, aiortsp.H265CodecName):
@@ -201,7 +202,7 @@ class RtspPlayerThread(QtCore.QThread):
                         try:
                             decoded_frames = codec.decode(packet)
                         except Exception as ex:
-                            self.log_ready.emit(f'{aiortsp.Tick.process_tick()} decode error pts={packet.pts}, ex={ex!r}')
+                            self.log_ready.emit(f'{Tick.process_tick():.3f} decode error pts={packet.pts}, ex={ex!r}')
                             continue
 
                         for decoded_frame in decoded_frames:
@@ -213,7 +214,7 @@ class RtspPlayerThread(QtCore.QThread):
                                     self.first_media_frame.emit()
                                     started_media_timer = True
                                 self.log_ready.emit(
-                                    f'{aiortsp.Tick.process_tick()} first video frame: width={width}, height={height}'
+                                    f'{Tick.process_tick():.3f} first video frame: width={width}, height={height}'
                                     f', session_elapsed={event.session_elapsed}s'
                                 )
                                 logged_first_video_frame = True
@@ -235,7 +236,7 @@ class RtspPlayerThread(QtCore.QThread):
                         if aframe.sample_rate:
                             duration_ms = aframe.sample_count * 1000.0 / aframe.sample_rate
                         self.log_ready.emit(
-                            f'{aiortsp.Tick.process_tick()} first audio frame: sample_rate={aframe.sample_rate}'
+                            f'{Tick.process_tick():.3f} first audio frame: sample_rate={aframe.sample_rate}'
                             f', duration_ms={duration_ms:.2f}, session_elapsed={event.session_elapsed}s'
                         )
                         logged_first_audio_frame = True
@@ -243,7 +244,7 @@ class RtspPlayerThread(QtCore.QThread):
 
                 elif isinstance(event, aiortsp.ClosedEvent):
                     message = (
-                        f'{aiortsp.Tick.process_tick()} rtsp closed, session_elapsed={event.session_elapsed}s, '
+                        f'{Tick.process_tick():.3f} rtsp closed, session_elapsed={event.session_elapsed}s, '
                         f'reason={event.reason}, exception={event.exception!r}'
                     )
                     if event.exception is not None:
@@ -257,7 +258,7 @@ class RtspPlayerThread(QtCore.QThread):
 
                 elif isinstance(event, aiortsp.RtspTimeoutError):
                     self.log_ready.emit(
-                        f'{aiortsp.Tick.process_tick()} rtsp timeout: {event!r}\n'
+                        f'{Tick.process_tick():.3f} rtsp timeout: {event!r}\n'
                         f'{"".join(traceback.format_exception(type(event), event, event.__traceback__))}'
                         f'the above exception was handled'
                     )
@@ -266,7 +267,7 @@ class RtspPlayerThread(QtCore.QThread):
 
                 elif isinstance(event, Exception):
                     self.log_ready.emit(
-                        f'{aiortsp.Tick.process_tick()} other exception: {event!r}\n'
+                        f'{Tick.process_tick():.3f} other exception: {event!r}\n'
                         f'{"".join(traceback.format_exception(type(event), event, event.__traceback__))}'
                         f'the above exception was handled'
                     )
@@ -297,7 +298,7 @@ class RtspPlayerThread(QtCore.QThread):
 
     def _log_rtsp(self, event: aiortsp.RtspMethodEvent) -> None:
         self.log_ready.emit(
-            f'{aiortsp.Tick.process_tick()} RTSP {event.method} status={event.status_code}'
+            f'{Tick.process_tick():.3f} RTSP {event.method} status={event.status_code}'
             f', cost={event.elapsed}s, session_elapsed={event.session_elapsed}s'
         )
 

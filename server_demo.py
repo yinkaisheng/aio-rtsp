@@ -19,6 +19,7 @@ def main() -> None:
     parser.add_argument("-d", "--dir", required=True, help="Directory to publish recursively")
     parser.add_argument("-H", "--host", default="0.0.0.0", help="Bind host[default 0.0.0.0]")
     parser.add_argument("-p", "--port", type=int, default=8554, help="Bind port[default 8554]")
+    parser.add_argument("-cp", "--control-port", type=int, default=8080, help="Control port[default 8080]")
     args = parser.parse_args()
 
     use_file_logger = 0
@@ -27,7 +28,7 @@ def main() -> None:
     else:
         config_logger(logger, 'info')
 
-    asyncio.run(server.serve(args.dir, args.host, args.port))
+    asyncio.run(server.serve(args.dir, args.host, args.port, control_port=args.control_port))
 
 
 if __name__ == "__main__":

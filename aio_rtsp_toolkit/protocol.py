@@ -302,10 +302,14 @@ class RtspProtocol(AsyncTCPClientBase[RtspRequest, int]):
             return None
         if media_type == "video":
             transport = f'{media_sdp["transport"]}/TCP;unicast;interleaved={self.video_rtp_channel}-{self.video_rtcp_channel}'
-            include_session = False
+            # The first successful SETUP in a session typically negotiates the Session id.
+            # Subsequent SETUPs (regardless of media type ordering) should include Session.
+            include_session = bool(self.session)
         elif media_type == "audio":
             transport = f'{media_sdp["transport"]}/TCP;unicast;interleaved={self.audio_rtp_channel}-{self.audio_rtcp_channel}'
-            include_session = True
+            # Audio may be the first (or only) SETUP request for audio-only resources.
+            # Only include Session header when a session has already been negotiated.
+            include_session = bool(self.session)
         else:
             raise ValueError(f'unsupported media_type: {media_type!r}')
         return await self._send_request(

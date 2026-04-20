@@ -9,7 +9,7 @@ class Tick:
 
     @staticmethod
     def process_tick() -> float:
-        return round(Tick.get_tick() - Tick._offset_tick, 6)
+        return Tick.get_tick() - Tick._offset_tick
 
     def __init__(self) -> None:
         self.reset()
@@ -23,11 +23,11 @@ class Tick:
 
     def since_start(self) -> float:
         self.last_tick = self.get_tick()
-        return round(self.last_tick - self.start_tick, 6)
+        return self.last_tick - self.start_tick
 
     def since_last(self) -> float:
         now = self.get_tick()
-        cost = round(now - (self.last_tick or self.start_tick), 6)
+        cost = now - (self.last_tick or self.start_tick)
         self.last_tick = now
         return cost
 

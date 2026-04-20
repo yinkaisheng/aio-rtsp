@@ -11,6 +11,7 @@ import av
 
 import aio_sockets as aio
 import aio_rtsp_toolkit as aiortsp
+from aio_rtsp_toolkit.tick import Tick
 import aio_rtsp_toolkit.audio_decode as audio_decode
 import aio_rtsp_toolkit.audio_playback as audio_playback
 
@@ -48,7 +49,7 @@ class WaveAudioSaver:
             self.channels = pcm_frame.channels
             log_tag = f"[{self.log_prefix}|{self.session_id}] " if self.session_id and self.log_prefix else f"[{self.session_id}] " if self.session_id else ""
             logger.info(
-                f"{log_tag}{aiortsp.Tick.process_tick()} {Fore.Cyan}save audio enabled{Fore.Reset}, "
+                f"{log_tag}{Tick.process_tick():.3f} {Fore.Cyan}save audio enabled{Fore.Reset}, "
                 f"path={self.file_path}, sample_rate={self.sample_rate}, channels={self.channels}"
             )
         elif self.sample_rate != pcm_frame.sample_rate or self.channels != pcm_frame.channels:
@@ -111,7 +112,7 @@ async def run_demo(
     log_tag = f"[{log_prefix}|{session_id}] " if session_id and log_prefix else f"[{session_id}] " if session_id else ""
 
     logger.info(
-        f"{log_tag}{aiortsp.Tick.process_tick()} {Fore.Cyan}audio mode={audio_mode}{Fore.Reset}, "
+        f"{log_tag}{Tick.process_tick():.3f} {Fore.Cyan}audio mode={audio_mode}{Fore.Reset}, "
         f"output_sample_rate={audio_output_sample_rate or 'source'}, "
         f"save_audio={save_audio_path or 'disabled'}"
     )
@@ -133,18 +134,18 @@ async def run_demo(
                 if isinstance(event, aiortsp.ConnectResultEvent):
                     if event.success:
                         logger.info(
-                            f"{aiortsp.Tick.process_tick()} {Fore.Green}RTSP connected{Fore.Reset}, "
+                            f"{Tick.process_tick():.3f} {Fore.Green}RTSP connected{Fore.Reset}, "
                             f"local_addr={event.local_addr}, elapsed={event.elapsed}s"
                         )
                     else:
                         logger.error(
-                            f"{aiortsp.Tick.process_tick()} {Fore.Red}RTSP connect failed{Fore.Reset}, "
+                            f"{Tick.process_tick():.3f} {Fore.Red}RTSP connect failed{Fore.Reset}, "
                             f"exception={event.exception!r}"
                         )
                         break
                 elif isinstance(event, aiortsp.RtspMethodEvent):
                     logger.info(
-                        f"{aiortsp.Tick.process_tick()} {Fore.Green}RTSP {event.method}{Fore.Reset}, "
+                        f"{Tick.process_tick():.3f} {Fore.Green}RTSP {event.method}{Fore.Reset}, "
                         f"status={event.status_code}, elapsed={event.elapsed:.3f}s"
                     )
                     if event.method == "DESCRIBE" and isinstance(event.response, aiortsp.RtspResponse):
@@ -163,14 +164,14 @@ async def run_demo(
                         video_rtp_count += 1
                         if video_rtp_count % log_every_count == 1:
                             logger.info(
-                                f"{aiortsp.Tick.process_tick()} {Fore.Green}video rtp{Fore.Reset} "
+                                f"{Tick.process_tick():.3f} {Fore.Green}video rtp{Fore.Reset} "
                                 f"seq={event.rtp.sequence_number} ts={event.rtp.timestamp}"
                             )
                     elif event.media_channel == "audio_rtp":
                         audio_rtp_count += 1
                         if audio_rtp_count % log_every_count == 1:
                             logger.info(
-                                f"{aiortsp.Tick.process_tick()} {Fore.Green}audio rtp{Fore.Reset} "
+                                f"{Tick.process_tick():.3f} {Fore.Green}audio rtp{Fore.Reset} "
                                 f"seq={event.rtp.sequence_number} ts={event.rtp.timestamp}"
                             )
                 elif isinstance(event, aiortsp.VideoFrameEvent):
@@ -178,7 +179,7 @@ async def run_demo(
                     if vframe is None:
                         continue
                     logger.info(
-                        f"{aiortsp.Tick.process_tick()} {Fore.Green}video frame{Fore.Reset} "
+                        f"{Tick.process_tick():.3f} {Fore.Green}video frame{Fore.Reset} "
                         f"ts={vframe.timestamp} nalu_type={vframe.nalu_type} size={len(vframe.data)} "
                         f"corrupt={vframe.is_corrupt}"
                     )
@@ -203,7 +204,7 @@ async def run_demo(
                         except Exception as ex:
                             decode_fail_count += 1
                             logger.error(
-                                f"{aiortsp.Tick.process_tick()} {Fore.Red}video decode error{Fore.Reset}, "
+                                f"{Tick.process_tick():.3f} {Fore.Red}video decode error{Fore.Reset}, "
                                 f"pts={packet.pts}, ex={ex!r}"
                             )
                             continue
@@ -216,7 +217,7 @@ async def run_demo(
                                 image.save(save_first_frame_path, "JPEG")
                                 first_frame_saved = True
                                 logger.info(
-                                    f"{aiortsp.Tick.process_tick()} {Fore.Cyan}saved first frame{Fore.Reset}, "
+                                    f"{Tick.process_tick():.3f} {Fore.Cyan}saved first frame{Fore.Reset}, "
                                     f"path={save_first_frame_path}"
                                 )
                             if first_decoded_tick == 0:
@@ -226,7 +227,7 @@ async def run_demo(
                     if aframe is None:
                         continue
                     logger.info(
-                        f"{aiortsp.Tick.process_tick()} {Fore.Green}audio frame{Fore.Reset} "
+                        f"{Tick.process_tick():.3f} {Fore.Green}audio frame{Fore.Reset} "
                         f"codec={aframe.codec_name_lower} ts={aframe.timestamp} size={len(aframe.data)}"
                     )
                     pcm_frames = audio_handler.feed(aframe)
@@ -238,7 +239,7 @@ async def run_demo(
                             first_decoded_tick = aiortsp.Tick.process_tick()
                 elif isinstance(event, aiortsp.RtspTimeoutError):
                     logger.error(
-                        f"{aiortsp.Tick.process_tick()} {Fore.Red}rtsp timeout{Fore.Reset}: {event!r} "
+                        f"{Tick.process_tick():.3f} {Fore.Red}rtsp timeout{Fore.Reset}: {event!r} "
                         f"session_elapsed={event.session_elapsed}\n"
                         f"{''.join(traceback.format_exception(type(event), event, event.__traceback__))}"
                         "the above exception was handled"
@@ -246,7 +247,7 @@ async def run_demo(
                     break
                 elif isinstance(event, aiortsp.RtspProtocolError):
                     logger.error(
-                        f"{aiortsp.Tick.process_tick()} {Fore.Red}rtsp protocol error{Fore.Reset}: {event!r} "
+                        f"{Tick.process_tick():.3f} {Fore.Red}rtsp protocol error{Fore.Reset}: {event!r} "
                         f"session_elapsed={event.session_elapsed}\n"
                         f"{''.join(traceback.format_exception(type(event), event, event.__traceback__))}"
                         "the above exception was handled"
@@ -254,7 +255,7 @@ async def run_demo(
                     break
                 elif isinstance(event, aiortsp.RtspResponseError):
                     logger.error(
-                        f"{aiortsp.Tick.process_tick()} {Fore.Red}rtsp response error{Fore.Reset}: {event!r} "
+                        f"{Tick.process_tick():.3f} {Fore.Red}rtsp response error{Fore.Reset}: {event!r} "
                         f"session_elapsed={event.session_elapsed}\n"
                         f"{''.join(traceback.format_exception(type(event), event, event.__traceback__))}"
                         "the above exception was handled"
@@ -262,14 +263,14 @@ async def run_demo(
                     break
                 elif isinstance(event, Exception):
                     logger.error(
-                        f"{aiortsp.Tick.process_tick()} {Fore.Red}other exception{Fore.Reset}: {event!r}\n"
+                        f"{Tick.process_tick():.3f} {Fore.Red}other exception{Fore.Reset}: {event!r}\n"
                         f"{''.join(traceback.format_exception(type(event), event, event.__traceback__))}"
                         "the above exception was handled"
                     )
                     break
                 elif isinstance(event, aiortsp.ClosedEvent):
                     message = (
-                        f"{aiortsp.Tick.process_tick()} {Fore.Green}session closed{Fore.Reset}, "
+                        f"{Tick.process_tick():.3f} {Fore.Green}session closed{Fore.Reset}, "
                         f"reason={event.reason}, exception={event.exception!r}"
                     )
                     if event.exception is not None:
@@ -283,7 +284,7 @@ async def run_demo(
                 if first_decoded_tick > 0 and aiortsp.Tick.process_tick() - first_decoded_tick >= play_time:
                     # await session.close()
                     if not stop_event.is_set():
-                        logger.info(f"{aiortsp.Tick.process_tick()} {Fore.Cyan}trigger stop{Fore.Reset}")
+                        logger.info(f"{Tick.process_tick():.3f} {Fore.Cyan}trigger stop{Fore.Reset}")
                         stop_event.set()
     finally:
         if audio_saver is not None:
@@ -291,7 +292,7 @@ async def run_demo(
         audio_handler.close()
 
     logger.info(
-        f"{aiortsp.Tick.process_tick()} done, video_rtp_count={video_rtp_count}, "
+        f"{Tick.process_tick():.3f} done, video_rtp_count={video_rtp_count}, "
         f"audio_rtp_count={audio_rtp_count}, decoded_frames={len(decoded_timestamps)}, "
         f"audio_pcm_frames={audio_pcm_count}, decode_fail_count={decode_fail_count}"
     )

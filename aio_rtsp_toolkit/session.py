@@ -238,23 +238,35 @@ class RtspSession:
                 if user_stop_event.is_set() or self._stop_event.is_set():
                     break
                 if self.enable_video:
-                    rtsp_resp = await self._run_method('SETUP', rtsp.setup_media, 'video')
-                    if rtsp_resp is None:
-                        break
-                    yield self._new_method_event('SETUP', rtsp_resp, media_type='video')
-                    self._ensure_ok('SETUP', rtsp_resp, 'video')
+                    # Some RTSP resources are audio-only (or video-only). In that case the SDP will not
+                    # contain the other media section and setup_media() returns None. We should skip
+                    # missing tracks rather than aborting the whole session.
+                    if rtsp.sdp.get("video") is not None:
+                        rtsp_resp = await self._run_method('SETUP', rtsp.setup_media, 'video')
+                        if rtsp_resp is None:
+                            break
+                        yield self._new_method_event('SETUP', rtsp_resp, media_type='video')
+                        self._ensure_ok('SETUP', rtsp_resp, 'video')
 
                 if user_stop_event.is_set() or self._stop_event.is_set():
                     break
                 if self.enable_audio:
-                    rtsp_resp = await self._run_method('SETUP', rtsp.setup_media, 'audio')
-                    if rtsp_resp is None:
-                        break
-                    yield self._new_method_event('SETUP', rtsp_resp, media_type='audio')
-                    self._ensure_ok('SETUP', rtsp_resp, 'audio')
+                    if rtsp.sdp.get("audio") is not None:
+                        rtsp_resp = await self._run_method('SETUP', rtsp.setup_media, 'audio')
+                        if rtsp_resp is None:
+                            break
+                        yield self._new_method_event('SETUP', rtsp_resp, media_type='audio')
+                        self._ensure_ok('SETUP', rtsp_resp, 'audio')
 
                 if user_stop_event.is_set() or self._stop_event.is_set():
                     break
+                if not rtsp.session:
+                    raise RtspProtocolError(
+                        'No RTSP Session negotiated (no successful SETUP). '
+                        'This usually means the stream does not contain the enabled media type(s), '
+                        'or the server did not return a Session header.',
+                        session_elapsed=rtsp.tick.since_start(),
+                    )
                 rtsp_resp = await self._run_method('PLAY', rtsp.play)
                 if rtsp_resp is None:
                     break
