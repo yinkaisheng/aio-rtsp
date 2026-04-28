@@ -19,14 +19,15 @@ def main() -> None:
     parser.add_argument("-d", "--dir", required=True, help="Directory to publish recursively")
     parser.add_argument("-H", "--host", default="0.0.0.0", help="Bind host[default 0.0.0.0]")
     parser.add_argument("-p", "--port", type=int, default=8554, help="Bind port[default 8554]")
-    parser.add_argument("-cp", "--control-port", type=int, default=8080, help="Control port[default 8080]")
+    parser.add_argument("-cp", "--control-port", type=int, default=8553, help="Control port[default 8553]")
+    parser.add_argument("-ld", "--log-dir", default=None, metavar="DIR",
+        help="Write logs under DIR/rtsp_server.log; omit for stdout only")
     args = parser.parse_args()
 
-    use_file_logger = 0
-    if use_file_logger:
-        config_logger(logger, 'info', log_dir='logs', log_file='rtsp_server.log')
+    if args.log_dir:
+        config_logger(logger, "info", log_dir=args.log_dir, log_file="rtsp_server.log")
     else:
-        config_logger(logger, 'info')
+        config_logger(logger, "info")
 
     asyncio.run(server.serve(args.dir, args.host, args.port, control_port=args.control_port))
 

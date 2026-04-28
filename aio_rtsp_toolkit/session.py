@@ -300,6 +300,7 @@ class RtspSession:
         )
 
     async def _run_keep_alive(self) -> None:
+        types.logger.info(f'{self.log_tag} run keep alive session_timeout={self._client.session_timeout}')
         timeout = max(self._client.session_timeout - 5, 10)
         while True:
             try:
