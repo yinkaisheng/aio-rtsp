@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aio-rtsp-toolkit"
-version = "0.1.3"
+version = "0.1.4"
 description = "Async RTSP client with protocol timing, RTP and frame events, plus a lightweight RTSP/TCP file server"
 readme = "README.md"
 authors = [{name = "yinkaisheng", email = "yinkaisheng@foxmail.com"}]
