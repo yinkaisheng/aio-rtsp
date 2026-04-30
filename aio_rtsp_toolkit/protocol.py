@@ -24,6 +24,23 @@ from .types import (
 )
 
 
+def _get_header(headers: HeaderMap, name: str, default: object = None) -> object:
+    values = []
+    name_lower = name.lower()
+    for key, value in headers.items():
+        if key.lower() != name_lower:
+            continue
+        if isinstance(value, list):
+            values.extend(value)
+        else:
+            values.append(value)
+    if not values:
+        return default
+    if len(values) == 1:
+        return values[0]
+    return values
+
+
 @dataclass
 class RtspRequest:
     method: str
@@ -167,7 +184,7 @@ class RtspProtocol(AsyncTCPClientBase[RtspRequest, int]):
 
     def get_response_key(self, message: object) -> Optional[int]:
         if isinstance(message, RtspResponse):
-            cseq = message.headers.get("CSeq")
+            cseq = _get_header(message.headers, "CSeq")
             if isinstance(cseq, int):
                 return cseq
         return None
@@ -227,13 +244,13 @@ class RtspProtocol(AsyncTCPClientBase[RtspRequest, int]):
             self._pending_methods.pop(request.cseq, None)
         if result is not None:
             result.elapsed = self.tick.since_last()
-            self._update_session_from_header(result.headers.get("Session", self.session))
+            self._update_session_from_header(_get_header(result.headers, "Session", self.session))
         return result
 
     def check_auth(self, rtsp_resp: RtspResponse) -> None:
         if rtsp_resp.status_code != 401 or not self.username or not self.password:
             return
-        auths = rtsp_resp.headers.get("WWW-Authenticate")
+        auths = _get_header(rtsp_resp.headers, "WWW-Authenticate")
         if auths is None:
             return
         if not isinstance(auths, list):
@@ -357,7 +374,7 @@ class RtspProtocol(AsyncTCPClientBase[RtspRequest, int]):
         for line in resp_lines[1:]:
             key, value = line.split(":", 1)
             value = value.lstrip()
-            if key in ("CSeq", "Content-Length"):
+            if key.lower() in ("cseq", "content-length"):
                 value = int(value)
             existing = headers.get(key)
             if existing is None:
@@ -367,7 +384,7 @@ class RtspProtocol(AsyncTCPClientBase[RtspRequest, int]):
             else:
                 headers[key] = [existing, value]
         body_start = index + 4
-        content_len = int(headers.get("Content-Length", 0) or 0)
+        content_len = int(_get_header(headers, "Content-Length", 0) or 0)
         if len(self.recv_buffer) - body_start < content_len:
             return None
         body = ""
@@ -398,7 +415,7 @@ class RtspProtocol(AsyncTCPClientBase[RtspRequest, int]):
             self.recv_buf_start = 0
 
     def _parse_sdp(self, rtsp_resp: RtspResponse) -> None:
-        self.content_base = rtsp_resp.headers.get("Content-Base", "")
+        self.content_base = _get_header(rtsp_resp.headers, "Content-Base", "")
         self.sdp = {}
         media_info = None
         for line in rtsp_resp.body.splitlines():
