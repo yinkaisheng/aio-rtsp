@@ -1,5 +1,7 @@
 # aio-rtsp-toolkit
 
+[中文版](README.zh-CN.md)
+
 `aio-rtsp-toolkit` is an asyncio-based RTSP toolkit for Python. It provides:
 
 - An RTSP client that exposes connection events, RTSP method timing, RTP packets, and assembled audio/video frames
@@ -244,7 +246,7 @@ You can still change the source defaults in the script, but it now also supports
 ```shell
 rtsp-client-cli -u rtsp://127.0.0.1:8554/morning_h264.mp4
 rtsp-client-cli -u rtsp://127.0.0.1:8554/morning_h264.mp4 --audio-mode decode --audio-rate 16000
-rtsp-client-cli -u rtsp://127.0.0.1:8554/morning_h264.mp4 --save-audio ""
+rtsp-client-cli -u rtsp://127.0.0.1:8554/morning_h264.mp4 --save-audio "" # disable audio saving
 rtsp-client-cli -u rtsp://127.0.0.1:8554/morning_h264.mp4 --audio-mode play --audio-rate 16000 --session-id s01 --log-prefix cam01
 ```
 
