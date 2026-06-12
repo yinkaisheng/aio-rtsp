@@ -7,7 +7,7 @@ import time
 from typing import List, Tuple
 
 from .server_media import H264CodecName, H265CodecName, extract_nalus, normalize_codec_name
-from .server_session_types import StreamTrackState, _is_disconnect_error
+from .server_session_types import StreamTrackState, _is_disconnect_error, is_track_setup
 
 
 MAX_RTP_PAYLOAD = 1400
@@ -151,7 +151,7 @@ class RtspRtpMixin:
         return packets
 
     async def _send_rtp_packet(self, state: StreamTrackState, payload: bytes, timestamp: int, marker: int) -> None:
-        if state.rtp_channel is None:
+        if not is_track_setup(state):
             return
         header = struct.pack(
             "!BBHII",
@@ -166,8 +166,34 @@ class RtspRtpMixin:
         state.octet_count += len(payload)
         state.last_rtp_timestamp = timestamp & 0xFFFFFFFF
         state.last_rtp_send_time = time.time()
-        await self._send_interleaved_frame(state.rtp_channel, header + payload)
+        await self._send_rtp_payload(state, header + payload)
         await self._maybe_send_rtcp_sr(state)
+
+    async def _send_rtp_payload(self, state: StreamTrackState, packet: bytes) -> None:
+        if state.transport_mode == "udp":
+            if state.rtp_socket is None or state.client_rtp_addr is None:
+                return
+            try:
+                state.rtp_socket.sendto(packet, state.client_rtp_addr)
+            except Exception as ex:
+                if _is_disconnect_error(ex):
+                    raise ConnectionResetError(*getattr(ex, "args", ())) from ex
+                raise
+            return
+        if state.rtp_channel is None:
+            return
+        await self._send_interleaved_frame(state.rtp_channel, packet)
+
+    async def _send_rtcp_payload(self, state: StreamTrackState, packet: bytes) -> None:
+        if state.transport_mode == "udp":
+            if state.rtcp_socket is None or state.client_rtcp_addr is None:
+                return
+            with contextlib.suppress(Exception):
+                state.rtcp_socket.sendto(packet, state.client_rtcp_addr)
+            return
+        if state.rtcp_channel is None:
+            return
+        await self._send_interleaved_frame(state.rtcp_channel, packet)
 
     async def _send_interleaved_frame(self, channel: int, payload: bytes) -> None:
         interleaved = b"$" + bytes([channel]) + struct.pack("!H", len(payload)) + payload
@@ -180,7 +206,11 @@ class RtspRtpMixin:
                 raise
 
     async def _maybe_send_rtcp_sr(self, state: StreamTrackState) -> None:
-        if state.rtcp_channel is None or state.packet_count <= 0 or state.last_rtp_send_time is None:
+        if not is_track_setup(state) or state.packet_count <= 0 or state.last_rtp_send_time is None:
+            return
+        if state.transport_mode == "tcp" and state.rtcp_channel is None:
+            return
+        if state.transport_mode == "udp" and state.rtcp_socket is None:
             return
         now = time.time()
         if state.last_rtcp_send_time is not None and now - state.last_rtcp_send_time < 5.0:
@@ -200,25 +230,54 @@ class RtspRtpMixin:
             state.packet_count & 0xFFFFFFFF,
             state.octet_count & 0xFFFFFFFF,
         )
-        await self._send_interleaved_frame(state.rtcp_channel, packet)
+        await self._send_rtcp_payload(state, packet)
         state.last_rtcp_send_time = now
+        rtcp_label = (
+            f"server_port={state.server_rtcp_port}"
+            if state.transport_mode == "udp"
+            else f"rtcp_channel={state.rtcp_channel}"
+        )
         self.logger.debug(
             f"{self.peername} sent rtcp sr track={state.info.control} "
-            f"rtcp_channel={state.rtcp_channel} packets={state.packet_count} octets={state.octet_count} "
+            f"{rtcp_label} packets={state.packet_count} octets={state.octet_count} "
             f"rtp_timestamp={state.last_rtp_timestamp}"
         )
 
     async def _send_rtcp_bye(self) -> None:
         for state in self.track_states.values():
-            if state.rtcp_channel is None:
+            if not is_track_setup(state):
+                continue
+            if state.transport_mode == "tcp" and state.rtcp_channel is None:
+                continue
+            if state.transport_mode == "udp" and state.rtcp_socket is None:
                 continue
             packet = struct.pack("!BBHI", 0x81, 203, 1, state.ssrc & 0xFFFFFFFF)
+            rtcp_label = (
+                f"server_port={state.server_rtcp_port}"
+                if state.transport_mode == "udp"
+                else f"rtcp_channel={state.rtcp_channel}"
+            )
             self.logger.info(
                 f"{self.peername} sent rtcp bye track={state.info.control} "
-                f"rtcp_channel={state.rtcp_channel} ssrc={state.ssrc:#x}"
+                f"{rtcp_label} ssrc={state.ssrc:#x}"
             )
             with contextlib.suppress(Exception):
-                await self._send_interleaved_frame(state.rtcp_channel, packet)
+                await self._send_rtcp_payload(state, packet)
+
+    async def _udp_rtcp_recv_loop(self, state: StreamTrackState) -> None:
+        if state.rtcp_socket is None:
+            return
+        while not self.closed:
+            try:
+                payload, _addr = await asyncio.wait_for(state.rtcp_socket.recvfrom(), timeout=1.0)
+            except asyncio.TimeoutError:
+                continue
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                break
+            if payload:
+                self._handle_rtcp_packet(state, payload)
 
     def _handle_interleaved_frame(self, channel: int, payload: bytes) -> None:
         if not payload:

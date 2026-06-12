@@ -76,6 +76,7 @@ async def run_demo(
     save_audio_path: str,
     session_id: Optional[str],
     log_prefix: str,
+    transport: str,
 ) -> None:
     stop_event = asyncio.Event()
     codec: Optional[av.codec.CodecContext] = None
@@ -113,6 +114,7 @@ async def run_demo(
 
     logger.info(
         f"{log_tag}{Tick.process_tick():.3f} {Fore.Cyan}audio mode={audio_mode}{Fore.Reset}, "
+        f"transport={transport}, "
         f"output_sample_rate={audio_output_sample_rate or 'source'}, "
         f"save_audio={save_audio_path or 'disabled'}"
     )
@@ -124,6 +126,7 @@ async def run_demo(
             timeout=timeout,
             session_id=session_id,
             log_prefix=log_prefix,
+            transport=transport,
             log_type=aiortsp.RtspClientMsgType.Exception
             | aiortsp.RtspClientMsgType.ConnectResult
             | aiortsp.RtspClientMsgType.Closed
@@ -315,6 +318,12 @@ def main() -> None:
         help="path for the first decoded video frame JPEG",
     )
     parser.add_argument(
+        "--transport",
+        choices=("tcp", "udp"),
+        default="tcp",
+        help="RTP transport for SETUP: tcp (interleaved) or udp (default: tcp)",
+    )
+    parser.add_argument(
         "--audio-mode",
         choices=("decode", "play"),
         default=AUDIO_MODE,
@@ -364,6 +373,7 @@ def main() -> None:
             save_audio_path=args.save_audio,
             session_id=args.session_id,
             log_prefix=args.log_prefix,
+            transport=args.transport,
         )
     )
 

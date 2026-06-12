@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import hashlib
 import struct
 import urllib.parse
 from dataclasses import dataclass
-from typing import Any, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
+
+import aio_sockets as aio
 
 from . import types
 from .tcp_client_base import AsyncTCPClientBase, RequestTimeoutError, RequestInterruptedError
@@ -24,6 +27,10 @@ from .types import (
 )
 
 
+RtspTransport = Literal["tcp", "udp"]
+UDP_PORT_START = 50000
+
+
 def _get_header(headers: HeaderMap, name: str, default: object = None) -> object:
     values = []
     name_lower = name.lower()
@@ -39,6 +46,38 @@ def _get_header(headers: HeaderMap, name: str, default: object = None) -> object
     if len(values) == 1:
         return values[0]
     return values
+
+
+def _parse_transport_param(transport: str, name: str) -> Optional[str]:
+    for part in (transport or "").split(";"):
+        part = part.strip()
+        if part.lower().startswith(f"{name.lower()}="):
+            return part.split("=", 1)[1].strip()
+    return None
+
+
+def _parse_port_pair(value: Optional[str]) -> Optional[Tuple[int, int]]:
+    if not value:
+        return None
+    left, _, right = value.partition("-")
+    if left.isdigit() and right.isdigit():
+        return int(left), int(right)
+    if value.isdigit():
+        port = int(value)
+        return port, port + 1
+    return None
+
+
+@dataclass
+class MediaTrackTransport:
+    media_type: str
+    client_rtp_port: int
+    client_rtcp_port: int
+    server_rtp_port: int
+    server_rtcp_port: int
+    server_host: str
+    rtp_socket: aio.UDPSocket
+    rtcp_socket: aio.UDPSocket
 
 
 @dataclass
@@ -77,13 +116,25 @@ class RtspProtocol(AsyncTCPClientBase[RtspRequest, int]):
         timeout: float = 4,
         log_type: int = 0,
         log_tag: str = "",
+        transport: RtspTransport = "tcp",
     ) -> None:
+        if transport not in ("tcp", "udp"):
+            raise ValueError(f"unsupported transport: {transport!r}")
         parse_result = urllib.parse.urlparse(url)
         connect_host = parse_result.hostname
         connect_port = parse_result.port if parse_result.port else 554
         if forward_address:
             connect_host, connect_port = forward_address
-        super().__init__(connect_host, connect_port, recv_size=65536, recv_timeout=timeout, stop_timeout=0.2, log_tag=log_tag)
+        # UDP RTP does not arrive on the RTSP TCP socket; avoid idle recv timeouts on the control connection.
+        control_recv_timeout = None if transport == "udp" else timeout
+        super().__init__(
+            connect_host,
+            connect_port,
+            recv_size=65536,
+            recv_timeout=control_recv_timeout,
+            stop_timeout=0.2,
+            log_tag=log_tag,
+        )
         self.user_agent = "python aio rtsp client"
         self.timeout = timeout
         self.log_type = log_type
@@ -123,6 +174,11 @@ class RtspProtocol(AsyncTCPClientBase[RtspRequest, int]):
         self.video_splicer: Optional[Union[H264Splicer, H265Splicer]] = None
         self.audio_splicer = None
         self._pending_methods: dict[int, str] = {}
+        self.transport: RtspTransport = transport
+        self._media_transports: Dict[str, MediaTrackTransport] = {}
+        self._udp_recv_tasks: Dict[str, asyncio.Task] = {}
+        self._next_udp_port = UDP_PORT_START
+        self._udp_port_lock = asyncio.Lock()
 
     async def connect(self) -> None:
         if self.is_connected:
@@ -135,6 +191,143 @@ class RtspProtocol(AsyncTCPClientBase[RtspRequest, int]):
             self.local_addr = self._sock.getsockname()
         if self.log_type & RtspClientMsgType.ConnectResult:
             types.logger.info(f'{self.log_tag} connected local_addr={self.local_addr}')
+
+    async def close(self, *, reason: str = "client closed connection", exception: Optional[Exception] = None) -> None:
+        await self._close_udp_transports()
+        await super().close(reason=reason, exception=exception)
+
+    async def _allocate_udp_port_pair(self) -> Tuple[int, int, aio.UDPSocket, aio.UDPSocket]:
+        async with self._udp_port_lock:
+            last_error: Optional[OSError] = None
+            for _ in range(512):
+                rtp_port = self._next_udp_port
+                if rtp_port % 2 == 1:
+                    rtp_port += 1
+                rtcp_port = rtp_port + 1
+                self._next_udp_port = rtcp_port + 1
+                if self._next_udp_port >= 65534:
+                    self._next_udp_port = UDP_PORT_START
+                try:
+                    rtp_sock = await aio.create_udp_socket(local_addr=("0.0.0.0", rtp_port))
+                    rtcp_sock = await aio.create_udp_socket(local_addr=("0.0.0.0", rtcp_port))
+                    return rtp_port, rtcp_port, rtp_sock, rtcp_sock
+                except OSError as ex:
+                    last_error = ex
+                    continue
+        raise RtspProtocolError(
+            f"failed to allocate UDP client ports: {last_error!r}",
+            session_elapsed=self.tick.since_start(),
+        )
+
+    def _rtp_channel_for_media(self, media_type: str) -> int:
+        if media_type == "video":
+            return self.video_rtp_channel
+        if media_type == "audio":
+            return self.audio_rtp_channel
+        raise ValueError(f"unsupported media_type: {media_type!r}")
+
+    def _build_setup_transport(self, media_type: str, client_ports: Optional[Tuple[int, int]]) -> str:
+        media_sdp = self.sdp[media_type]
+        if self.transport == "tcp":
+            if media_type == "video":
+                return (
+                    f'{media_sdp["transport"]}/TCP;unicast;'
+                    f'interleaved={self.video_rtp_channel}-{self.video_rtcp_channel}'
+                )
+            return (
+                f'{media_sdp["transport"]}/TCP;unicast;'
+                f'interleaved={self.audio_rtp_channel}-{self.audio_rtcp_channel}'
+            )
+        if client_ports is None:
+            raise RtspProtocolError(
+                f"UDP client ports missing for {media_type} SETUP",
+                session_elapsed=self.tick.since_start(),
+            )
+        client_rtp_port, client_rtcp_port = client_ports
+        return f'{media_sdp["transport"]};unicast;client_port={client_rtp_port}-{client_rtcp_port}'
+
+    def _finish_udp_setup(
+        self,
+        media_type: str,
+        rtsp_resp: RtspResponse,
+        client_rtp_port: int,
+        client_rtcp_port: int,
+        rtp_sock: aio.UDPSocket,
+        rtcp_sock: aio.UDPSocket,
+    ) -> None:
+        transport_header = str(_get_header(rtsp_resp.headers, "Transport", "") or "")
+        server_ports = _parse_port_pair(_parse_transport_param(transport_header, "server_port"))
+        if server_ports is None:
+            rtp_sock.close()
+            rtcp_sock.close()
+            raise RtspProtocolError(
+                f"SETUP response missing server_port for {media_type}",
+                session_elapsed=self.tick.since_start(),
+            )
+        server_host = _parse_transport_param(transport_header, "source") or self.host or self.server_ip
+        server_rtp_port, server_rtcp_port = server_ports
+        self._media_transports[media_type] = MediaTrackTransport(
+            media_type=media_type,
+            client_rtp_port=client_rtp_port,
+            client_rtcp_port=client_rtcp_port,
+            server_rtp_port=server_rtp_port,
+            server_rtcp_port=server_rtcp_port,
+            server_host=server_host,
+            rtp_socket=rtp_sock,
+            rtcp_socket=rtcp_sock,
+        )
+        if self.log_type & RtspClientMsgType.RTSP:
+            types.logger.info(
+                f"{self.log_tag} udp setup {media_type} client={client_rtp_port}-{client_rtcp_port} "
+                f"server={server_host}:{server_rtp_port}-{server_rtcp_port}"
+            )
+        self._start_udp_recv_task(media_type)
+
+    def _start_udp_recv_task(self, media_type: str) -> None:
+        current = self._udp_recv_tasks.get(media_type)
+        if current is not None and not current.done():
+            return
+        self._udp_recv_tasks[media_type] = asyncio.create_task(
+            self._udp_rtp_recv_loop(media_type),
+            name=f"rtsp-udp-{media_type}-{self.log_tag}",
+        )
+
+    async def _udp_rtp_recv_loop(self, media_type: str) -> None:
+        track = self._media_transports.get(media_type)
+        if track is None:
+            return
+        rtp_channel = self._rtp_channel_for_media(media_type)
+        while not self._closed:
+            try:
+                data, _addr = await asyncio.wait_for(track.rtp_socket.recvfrom(), timeout=1.0)
+            except asyncio.TimeoutError:
+                continue
+            except asyncio.CancelledError:
+                raise
+            except Exception as ex:
+                if self.log_type & RtspClientMsgType.Exception:
+                    types.logger.error(f"{self.log_tag} udp recv {media_type} ex={ex!r}")
+                break
+            if not data:
+                continue
+            try:
+                rtp = self.parse_rtp(data)
+            except Exception as ex:
+                if self.log_type & RtspClientMsgType.Exception:
+                    types.logger.error(f"{self.log_tag} udp parse rtp {media_type} ex={ex!r}")
+                continue
+            await self._emit_event(RtspInterleavedData(rtp_channel, rtp))
+
+    async def _close_udp_transports(self) -> None:
+        for task in list(self._udp_recv_tasks.values()):
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+        self._udp_recv_tasks.clear()
+        for track in self._media_transports.values():
+            track.rtp_socket.close()
+            track.rtcp_socket.close()
+        self._media_transports.clear()
 
     def encode_message(self, message: RtspRequest) -> bytes:
         if not isinstance(message, RtspRequest):
@@ -317,26 +510,53 @@ class RtspProtocol(AsyncTCPClientBase[RtspRequest, int]):
         media_sdp = self.sdp.get(media_type)
         if media_sdp is None:
             return None
-        if media_type == "video":
-            transport = f'{media_sdp["transport"]}/TCP;unicast;interleaved={self.video_rtp_channel}-{self.video_rtcp_channel}'
-            # The first successful SETUP in a session typically negotiates the Session id.
-            # Subsequent SETUPs (regardless of media type ordering) should include Session.
-            include_session = bool(self.session)
-        elif media_type == "audio":
-            transport = f'{media_sdp["transport"]}/TCP;unicast;interleaved={self.audio_rtp_channel}-{self.audio_rtcp_channel}'
-            # Audio may be the first (or only) SETUP request for audio-only resources.
-            # Only include Session header when a session has already been negotiated.
-            include_session = bool(self.session)
-        else:
+        if media_type not in {"video", "audio"}:
             raise ValueError(f'unsupported media_type: {media_type!r}')
-        return await self._send_request(
-            self._make_request(
-                "SETUP",
-                media_sdp["control"],
-                self._base_headers("SETUP", include_session=include_session, extra_headers=[("Transport", transport)]),
-                media_type=media_type,
+        # The first successful SETUP in a session typically negotiates the Session id.
+        # Subsequent SETUPs should include Session when one is already negotiated.
+        include_session = bool(self.session)
+        client_ports: Optional[Tuple[int, int]] = None
+        rtp_sock: Optional[aio.UDPSocket] = None
+        rtcp_sock: Optional[aio.UDPSocket] = None
+        if self.transport == "udp":
+            client_rtp_port, client_rtcp_port, rtp_sock, rtcp_sock = await self._allocate_udp_port_pair()
+            client_ports = (client_rtp_port, client_rtcp_port)
+        transport = self._build_setup_transport(media_type, client_ports)
+        try:
+            rtsp_resp = await self._send_request(
+                self._make_request(
+                    "SETUP",
+                    media_sdp["control"],
+                    self._base_headers(
+                        "SETUP",
+                        include_session=include_session,
+                        extra_headers=[("Transport", transport)],
+                    ),
+                    media_type=media_type,
+                )
             )
-        )
+        except Exception:
+            if rtp_sock is not None:
+                rtp_sock.close()
+            if rtcp_sock is not None:
+                rtcp_sock.close()
+            raise
+        if rtsp_resp is None or rtsp_resp.status_code != 200:
+            if rtp_sock is not None:
+                rtp_sock.close()
+            if rtcp_sock is not None:
+                rtcp_sock.close()
+            return rtsp_resp
+        if self.transport == "udp" and rtp_sock is not None and rtcp_sock is not None and client_ports is not None:
+            self._finish_udp_setup(
+                media_type,
+                rtsp_resp,
+                client_ports[0],
+                client_ports[1],
+                rtp_sock,
+                rtcp_sock,
+            )
+        return rtsp_resp
 
     async def play(self) -> Optional[RtspResponse]:
         return await self._send_request(

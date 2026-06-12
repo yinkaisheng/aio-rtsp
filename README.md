@@ -65,6 +65,8 @@ sudo apt install -y libportaudio2
 
 If the RTSP stream requires authentication, include credentials in the URL, for example `rtsp://user:password@192.168.1.122:554/stream`. If the username or password contains reserved characters such as `@`, `:`, or `/`, URL-encode them first.
 
+Use `transport="udp"` when the server publishes RTP over UDP (for example VLC's default RTSP mode). The default is `transport="tcp"`.
+
 ```python
 import asyncio
 import aio_rtsp_toolkit as aiortsp
@@ -123,7 +125,7 @@ asyncio.run(main())
 
 Current server behavior:
 
-- Transport is RTSP over TCP with interleaved RTP/RTCP only
+- Transport supports interleaved RTP/RTCP over RTSP/TCP and unicast RTP/AVP over UDP
 - Files are resolved relative to the configured root directory
 - Files outside the root are rejected
 - Unsupported codecs are skipped rather than transcoded
@@ -160,6 +162,7 @@ rtsp://127.0.0.1:8554/zhongli.wav?play_count=0
 
 ### Session Notes
 
+- Use `transport="udp"` for unicast RTP/AVP over UDP; default is `transport="tcp"` (interleaved RTP/RTCP)
 - Use `enable_video=False` or `enable_audio=False` for single-media sessions
 - At least one of `enable_video` or `enable_audio` must be `True`
 - `iter_events(stop_event)` accepts `threading.Event` or `asyncio.Event`
@@ -268,9 +271,11 @@ rtsp-client-cli -u rtsp://127.0.0.1:8554/morning_h264.mp4
 
 ## API Summary
 
-### `RtspSession(rtsp_url, forward_address=None, timeout=4, session_id=None, enable_video=True, enable_audio=True, log_type=RtspClientMsgType.RTSP, log_prefix='')`
+### `RtspSession(rtsp_url, forward_address=None, timeout=4, session_id=None, enable_video=True, enable_audio=True, transport="tcp", log_type=RtspClientMsgType.RTSP, log_prefix='')`
 
 High-level reusable RTSP session object. Use it with `async with` and consume events through `iter_events()`.
+
+`transport` selects the RTP transport for SETUP: `"tcp"` uses interleaved RTP/RTCP over the RTSP connection (default); `"udp"` uses unicast RTP/AVP over UDP.
 
 `forward_address` lets you keep the original RTSP URL while connecting through another TCP endpoint, such as a relay, tunnel, or forwarded host.
 
@@ -278,7 +283,7 @@ High-level reusable RTSP session object. Use it with `async with` and consume ev
 
 Starts the session, yields typed events, and closes the socket when iteration ends or fails.
 
-### `open_session(rtsp_url, forward_address=None, timeout=4, session_id=None, enable_video=True, enable_audio=True, log_type=RtspClientMsgType.RTSP, log_prefix='') -> RtspSession`
+### `open_session(rtsp_url, forward_address=None, timeout=4, session_id=None, enable_video=True, enable_audio=True, transport="tcp", log_type=RtspClientMsgType.RTSP, log_prefix='') -> RtspSession`
 
 Convenience helper that returns a `RtspSession`.
 

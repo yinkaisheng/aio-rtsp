@@ -17,7 +17,9 @@ from .server_session_types import (
     RtspBadRequestError,
     RtspServerError,
     StreamTrackState,
+    TransportRequest,
     _is_disconnect_error,
+    is_track_setup,
 )
 from .server_streaming import RtspStreamingMixin
 
@@ -112,7 +114,22 @@ class RtspServerSession(RtspStreamingMixin, RtspRtpMixin, RtspProtocolMixin):
             self.timeout_task = None
         await self._stop_streaming()
         await self._send_rtcp_bye()
+        await self._close_track_transports()
         await self._close_transport()
+
+    async def _close_track_transports(self) -> None:
+        for state in self.track_states.values():
+            if state.rtcp_recv_task is not None:
+                state.rtcp_recv_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await state.rtcp_recv_task
+                state.rtcp_recv_task = None
+            if state.rtp_socket is not None:
+                state.rtp_socket.close()
+                state.rtp_socket = None
+            if state.rtcp_socket is not None:
+                state.rtcp_socket.close()
+                state.rtcp_socket = None
 
     async def _close_transport(self) -> None:
         if self.closed:
@@ -199,6 +216,17 @@ class RtspServerSession(RtspStreamingMixin, RtspRtpMixin, RtspProtocolMixin):
             body=self.media_source.build_sdp().encode("utf-8"),
         )
 
+    def _advertised_server_host(self, req_headers: Dict[str, str]) -> str:
+        host_header = req_headers.get("host", "")
+        if host_header:
+            return host_header.split(":", 1)[0]
+        local_host = self.sock.getsockname()[0]
+        if local_host and local_host not in {"0.0.0.0", "::"}:
+            return local_host
+        if self.server.host not in {"0.0.0.0", "::"}:
+            return self.server.host
+        return self.peername[0]
+
     async def _handle_setup(self, uri: str, req_headers: Dict[str, str]) -> None:
         if self.media_source is None:
             await self._send_response(req_headers, 454, "Session Not Found")
@@ -212,7 +240,17 @@ class RtspServerSession(RtspStreamingMixin, RtspRtpMixin, RtspProtocolMixin):
         if state is None:
             await self._send_response(req_headers, 404, "Not Found")
             return
-        channels = self.server.parse_interleaved_channels(req_headers.get("transport", ""))
+        transport_req = self.server.parse_transport_request(req_headers.get("transport", ""))
+        if transport_req is None:
+            await self._send_response(req_headers, 461, "Unsupported Transport")
+            return
+        if transport_req.mode == "tcp":
+            await self._handle_setup_tcp(state, req_headers, transport_req)
+        else:
+            await self._handle_setup_udp(state, req_headers, transport_req)
+
+    async def _handle_setup_tcp(self, state: StreamTrackState, req_headers: Dict[str, str], transport_req: TransportRequest) -> None:
+        channels = transport_req.interleaved
         if channels is None:
             await self._send_response(req_headers, 461, "Unsupported Transport")
             return
@@ -222,15 +260,18 @@ class RtspServerSession(RtspStreamingMixin, RtspRtpMixin, RtspProtocolMixin):
         for other_state in self.track_states.values():
             if other_state.info.control == state.info.control:
                 continue
+            if other_state.transport_mode != "tcp":
+                continue
             if channels[0] in (other_state.rtp_channel, other_state.rtcp_channel) or channels[1] in (other_state.rtp_channel, other_state.rtcp_channel):
                 await self._send_response(req_headers, 400, "Bad Request", body=b"interleaved channels already in use")
                 return
+        state.transport_mode = "tcp"
         state.rtp_channel, state.rtcp_channel = channels
         self.session_active = True
         self._mark_activity()
         self.logger.info(
             f"{self.peername} setup track={state.info.control} codec={state.info.codec_name} "
-            f"rtp_channel={channels[0]} rtcp_channel={channels[1]}"
+            f"transport=tcp rtp_channel={channels[0]} rtcp_channel={channels[1]}"
         )
         await self._send_response(
             req_headers,
@@ -238,6 +279,62 @@ class RtspServerSession(RtspStreamingMixin, RtspRtpMixin, RtspProtocolMixin):
             "OK",
             {
                 "Transport": f"RTP/AVP/TCP;unicast;interleaved={channels[0]}-{channels[1]}",
+                "Session": self._session_header_value(),
+            },
+        )
+
+    async def _handle_setup_udp(self, state: StreamTrackState, req_headers: Dict[str, str], transport_req: TransportRequest) -> None:
+        client_ports = transport_req.client_ports
+        if client_ports is None:
+            await self._send_response(req_headers, 461, "Unsupported Transport")
+            return
+        client_rtp_port, client_rtcp_port = client_ports
+        if client_rtp_port == client_rtcp_port:
+            await self._send_response(req_headers, 400, "Bad Request", body=b"client RTP and RTCP ports must differ")
+            return
+        if state.rtcp_recv_task is not None:
+            state.rtcp_recv_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await state.rtcp_recv_task
+            state.rtcp_recv_task = None
+        if state.rtp_socket is not None:
+            state.rtp_socket.close()
+            state.rtp_socket = None
+        if state.rtcp_socket is not None:
+            state.rtcp_socket.close()
+            state.rtcp_socket = None
+        client_host = self.peername[0]
+        rtp_port, rtcp_port, rtp_sock, rtcp_sock = await self.server.allocate_udp_sockets()
+        state.transport_mode = "udp"
+        state.rtp_channel = None
+        state.rtcp_channel = None
+        state.rtp_socket = rtp_sock
+        state.rtcp_socket = rtcp_sock
+        state.client_rtp_addr = (client_host, client_rtp_port)
+        state.client_rtcp_addr = (client_host, client_rtcp_port)
+        state.server_rtp_port = rtp_port
+        state.server_rtcp_port = rtcp_port
+        state.rtcp_recv_task = asyncio.create_task(
+            self._udp_rtcp_recv_loop(state),
+            name=f"rtsp-rtcp-udp-{self.session_id}-{state.info.control}",
+        )
+        self.session_active = True
+        self._mark_activity()
+        source = self._advertised_server_host(req_headers)
+        self.logger.info(
+            f"{self.peername} setup track={state.info.control} codec={state.info.codec_name} "
+            f"transport=udp client={client_host}:{client_rtp_port}-{client_rtcp_port} "
+            f"server={rtp_port}-{rtcp_port} source={source}"
+        )
+        await self._send_response(
+            req_headers,
+            200,
+            "OK",
+            {
+                "Transport": (
+                    f"RTP/AVP;unicast;client_port={client_rtp_port}-{client_rtcp_port};"
+                    f"server_port={rtp_port}-{rtcp_port};source={source}"
+                ),
                 "Session": self._session_header_value(),
             },
         )
@@ -250,7 +347,7 @@ class RtspServerSession(RtspStreamingMixin, RtspRtpMixin, RtspProtocolMixin):
         if session_header.split(";", 1)[0] != self.session_id:
             await self._send_response(req_headers, 454, "Session Not Found")
             return
-        if not any(state.rtp_channel is not None for state in self.track_states.values()):
+        if not any(is_track_setup(state) for state in self.track_states.values()):
             await self._send_response(req_headers, 455, "Method Not Valid In This State")
             return
         await self._stop_streaming()
@@ -258,7 +355,7 @@ class RtspServerSession(RtspStreamingMixin, RtspRtpMixin, RtspProtocolMixin):
         rtp_info = [
             f"url={self.content_base}{state.info.control};seq=1;rtptime=0"
             for state in self.track_states.values()
-            if state.rtp_channel is not None
+            if is_track_setup(state)
         ]
         await self._send_response(
             req_headers,
@@ -270,11 +367,19 @@ class RtspServerSession(RtspStreamingMixin, RtspRtpMixin, RtspProtocolMixin):
                 "RTP-Info": ",".join(rtp_info),
             },
         )
-        active_tracks = [
-            f"{state.info.control}:{state.info.codec_name}/rtp={state.rtp_channel}/rtcp={state.rtcp_channel}"
-            for state in self.track_states.values()
-            if state.rtp_channel is not None
-        ]
+        active_tracks = []
+        for state in self.track_states.values():
+            if not is_track_setup(state):
+                continue
+            if state.transport_mode == "udp":
+                active_tracks.append(
+                    f"{state.info.control}:{state.info.codec_name}/udp="
+                    f"{state.server_rtp_port}-{state.server_rtcp_port}"
+                )
+            else:
+                active_tracks.append(
+                    f"{state.info.control}:{state.info.codec_name}/rtp={state.rtp_channel}/rtcp={state.rtcp_channel}"
+                )
         self.logger.info(
             f"{self.peername} play session={self.session_id} play_count={self.play_count} "
             f"tracks={', '.join(active_tracks)}"

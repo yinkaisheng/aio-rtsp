@@ -7,7 +7,7 @@ import traceback
 from typing import AsyncIterator, Awaitable, Callable, List, Optional, Union, cast
 
 from . import types
-from .protocol import RtspInterleavedData, RtspProtocol, RtspResponse
+from .protocol import RtspInterleavedData, RtspProtocol, RtspResponse, RtspTransport
 from .types import (
     DEFAULT_LOG_TYPE,
     AudioFrameEvent,
@@ -43,6 +43,7 @@ class RtspSession:
         session_id: Optional[str] = None,
         enable_video: bool = True,
         enable_audio: bool = True,
+        transport: RtspTransport = "tcp",
         log_type: int = DEFAULT_LOG_TYPE,
         log_prefix: str = '',
     ) -> None:
@@ -54,6 +55,7 @@ class RtspSession:
         self.log_tag = f'[{log_prefix}|{self.session_id}]' if log_prefix else f'[{self.session_id}]'
         self.enable_video = enable_video
         self.enable_audio = enable_audio
+        self.transport = transport
         self._client: Optional[RtspProtocol] = None
         self._closed = False
         self._event_queue: Optional[asyncio.Queue] = None
@@ -128,7 +130,14 @@ class RtspSession:
         """
         if not self.enable_video and not self.enable_audio:
             raise ValueError('At least one of enable_video or enable_audio must be True')
-        self._client = RtspProtocol(self.rtsp_url, self.forward_address, self.timeout, self.log_type, self.log_tag)
+        self._client = RtspProtocol(
+            self.rtsp_url,
+            self.forward_address,
+            self.timeout,
+            self.log_type,
+            self.log_tag,
+            transport=self.transport,
+        )
         self._closed = False
         self._event_receiver_exception = None
         self._close_reason = None
@@ -447,6 +456,7 @@ def open_session(
     session_id: Optional[str] = None,
     enable_video: bool = True,
     enable_audio: bool = True,
+    transport: RtspTransport = "tcp",
     log_type: int = DEFAULT_LOG_TYPE,
     log_prefix: str = '',
 ) -> RtspSession:
@@ -459,4 +469,5 @@ def open_session(
         session_id=session_id,
         enable_video=enable_video,
         enable_audio=enable_audio,
+        transport=transport,
     )

@@ -18,6 +18,7 @@ from .server_session_types import (
     RtspServerError,
     _is_disconnect_error,
     _iter_audio_frames,
+    is_track_setup,
 )
 from .server_voice import QueuedWorkerSignal, VoiceStreamChunk, VoiceStreamEnd
 
@@ -82,7 +83,7 @@ class RtspStreamingMixin:
     async def _stream_shared_voice(self) -> None:
         if self.media_source is None:
             return
-        state = next((item for item in self.track_states.values() if item.rtp_channel is not None), None)
+        state = next((item for item in self.track_states.values() if is_track_setup(item)), None)
         if state is None:
             return
         voice_stream = self.server.get_voice_stream(self.media_source.stream_id)
@@ -114,7 +115,7 @@ class RtspStreamingMixin:
     async def _send_pre_fill_silence(self) -> None:
         if self.media_source is None or self.pre_fill_ms <= 0:
             return
-        state = next((item for item in self.track_states.values() if item.rtp_channel is not None), None)
+        state = next((item for item in self.track_states.values() if is_track_setup(item)), None)
         if state is None:
             return
         if not self._supports_pre_fill():
@@ -176,7 +177,7 @@ class RtspStreamingMixin:
                 if not isinstance(item, QueuedMediaPacket):
                     continue
                 state = self.track_states.get(item.track_control)
-                if state is None or state.rtp_channel is None:
+                if state is None or not is_track_setup(state):
                     continue
                 if item.kind == "video":
                     await self._send_video_packet(state, item.data, item.media_time, item.duration_seconds, item.is_keyframe)
@@ -237,7 +238,7 @@ class RtspStreamingMixin:
         stream_states = {
             state.info.av_stream_index: state
             for state in self.track_states.values()
-            if state.rtp_channel is not None and state.info.av_stream_index is not None
+            if is_track_setup(state) and state.info.av_stream_index is not None
         }
         if not stream_states:
             return
@@ -340,7 +341,7 @@ class RtspStreamingMixin:
         queue: asyncio.Queue,
         stop_event: threading.Event,
     ) -> None:
-        state = next((it for it in self.track_states.values() if it.rtp_channel is not None), None)
+        state = next((it for it in self.track_states.values() if is_track_setup(it)), None)
         if state is None:
             return
         resampler = av.AudioResampler(format="s16", layout="mono", rate=PCMA_CLOCK_RATE)

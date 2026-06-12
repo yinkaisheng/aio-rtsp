@@ -1,8 +1,9 @@
-"""Async RTSP/TCP file server.
+"""Async RTSP file server.
 
-Serves local media files over RTSP interleaved TCP. Container video/audio tracks
-are streamed directly when supported, and WAV input is resampled and encoded as
-PCMA 8 kHz mono before being advertised and sent to RTSP clients."""
+Serves local media files over RTSP with interleaved TCP or UDP RTP/RTCP.
+Container video/audio tracks are streamed directly when supported, and WAV
+input is resampled and encoded as PCMA 8 kHz mono before being advertised
+and sent to RTSP clients."""
 
 from __future__ import annotations
 
@@ -24,7 +25,11 @@ from .server_session import (
 from .server_voice import SharedVoiceStream, VoiceStreamError
 
 
+from .server_session_types import TransportRequest
+
+
 logger: aio.LoggerLike = aio.StdoutLogger()
+UDP_PORT_START = 50000
 
 
 class RtspServer:
@@ -55,6 +60,8 @@ class RtspServer:
         self._media_source_loader = MediaSourceLoader(self.session_name)
         self._voice_streams: Dict[str, SharedVoiceStream] = {}
         self._voice_streams_lock = asyncio.Lock()
+        self._next_udp_port = UDP_PORT_START
+        self._udp_port_lock = asyncio.Lock()
 
     async def start(self) -> "RtspServer":
         self._server = await aio.start_tcp_server(self._handle_client, self.host, self.port)
@@ -273,7 +280,7 @@ class RtspServer:
 
     def parse_interleaved_channels(self, transport: str) -> Optional[Tuple[int, int]]:
         lower = transport.lower()
-        if "rtp/avp/tcp" not in lower:
+        if "rtp/avp/tcp" not in lower and "interleaved=" not in lower:
             return None
         for part in transport.split(";"):
             if part.strip().lower().startswith("interleaved="):
@@ -285,6 +292,63 @@ class RtspServer:
                         return channels
                     raise ValueError("interleaved channel must be between 0 and 255")
         return None
+
+    def parse_client_ports(self, transport: str) -> Optional[Tuple[int, int]]:
+        lower = transport.lower()
+        if "client_port" not in lower:
+            return None
+        for part in transport.split(";"):
+            part = part.strip()
+            if not part.lower().startswith("client_port="):
+                continue
+            value = part.split("=", 1)[1].strip()
+            left, _, right = value.partition("-")
+            if left.isdigit() and right.isdigit():
+                ports = (int(left), int(right))
+            elif value.isdigit():
+                rtp_port = int(value)
+                ports = (rtp_port, rtp_port + 1)
+            else:
+                return None
+            if not all(1 <= port <= 65535 for port in ports):
+                raise ValueError("client_port must be between 1 and 65535")
+            return ports
+        return None
+
+    def parse_transport_request(self, transport: str) -> Optional[TransportRequest]:
+        lower = (transport or "").lower()
+        if not lower or "multicast" in lower:
+            return None
+        if "rtp/avp/tcp" in lower or ("interleaved=" in lower and "/tcp" in lower):
+            channels = self.parse_interleaved_channels(transport)
+            if channels is not None:
+                return TransportRequest(mode="tcp", interleaved=channels)
+            return None
+        if "rtp/avp" in lower:
+            client_ports = self.parse_client_ports(transport)
+            if client_ports is not None:
+                return TransportRequest(mode="udp", client_ports=client_ports)
+        return None
+
+    async def allocate_udp_sockets(self) -> Tuple[int, int, aio.UDPSocket, aio.UDPSocket]:
+        async with self._udp_port_lock:
+            last_error: Optional[OSError] = None
+            for _ in range(512):
+                rtp_port = self._next_udp_port
+                if rtp_port % 2 == 1:
+                    rtp_port += 1
+                rtcp_port = rtp_port + 1
+                self._next_udp_port = rtcp_port + 1
+                if self._next_udp_port >= 65534:
+                    self._next_udp_port = UDP_PORT_START
+                try:
+                    rtp_sock = await aio.create_udp_socket(local_addr=("0.0.0.0", rtp_port))
+                    rtcp_sock = await aio.create_udp_socket(local_addr=("0.0.0.0", rtcp_port))
+                    return rtp_port, rtcp_port, rtp_sock, rtcp_sock
+                except OSError as ex:
+                    last_error = ex
+                    continue
+            raise RtspServerError(f"failed to allocate UDP ports: {last_error!r}")
 
     def load_media_source(self, file_path: Path) -> MediaSource:
         return self._media_source_loader.load(file_path)

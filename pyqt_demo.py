@@ -69,6 +69,7 @@ class RtspPlayerThread(QtCore.QThread):
         timeout: int,
         enable_video: bool = True,
         enable_audio: bool = True,
+        transport: str = "tcp",
         session_id: str = DEFAULT_SESSION_ID,
         log_prefix: str = DEFAULT_LOG_PREFIX,
         parent: Optional[QtCore.QObject] = None,
@@ -78,6 +79,7 @@ class RtspPlayerThread(QtCore.QThread):
         self.timeout = timeout
         self.enable_video = enable_video
         self.enable_audio = enable_audio
+        self.transport = transport
         self.stop_event = threading.Event()
         self.session_id = session_id
         self.log_prefix = log_prefix
@@ -284,6 +286,7 @@ class RtspPlayerThread(QtCore.QThread):
             timeout=self.timeout,
             enable_video=self.enable_video,
             enable_audio=self.enable_audio,
+            transport=self.transport,
             log_type=aiortsp.RtspClientMsgType.Exception
             | aiortsp.RtspClientMsgType.ConnectResult
             | aiortsp.RtspClientMsgType.Closed
@@ -339,6 +342,13 @@ class MainWindow(QtWidgets.QWidget):
         self.video_check.setChecked(True)
         self.audio_check = QtWidgets.QCheckBox('Audio')
         self.audio_check.setChecked(True)
+
+        self.transport_combo = QtWidgets.QComboBox()
+        self.transport_combo.addItem('TCP', 'tcp')
+        self.transport_combo.addItem('UDP', 'udp')
+        self.transport_combo.setCurrentIndex(0)
+        self.transport_combo.setToolTip('RTP transport for RTSP SETUP')
+
         self.duration_label = QtWidgets.QLabel('')
 
         self.play_button = QtWidgets.QPushButton('Play')
@@ -358,6 +368,8 @@ class MainWindow(QtWidgets.QWidget):
         form_layout.addWidget(self.timeout_spin)
         form_layout.addWidget(self.video_check)
         form_layout.addWidget(self.audio_check)
+        form_layout.addWidget(QtWidgets.QLabel('Transport'))
+        form_layout.addWidget(self.transport_combo)
         form_layout.addWidget(self.duration_label)
         form_layout.addWidget(self.play_button)
         form_layout.addWidget(self.stop_button)
@@ -396,8 +408,10 @@ class MainWindow(QtWidgets.QWidget):
             media_mode.append('video')
         if self.audio_check.isChecked():
             media_mode.append('audio')
+        transport = self.transport_combo.currentData()
         self.append_log(
-            f'start play: url={rtsp_url}, timeout={self.timeout_spin.value()}s, media={"+".join(media_mode)}'
+            f'start play: url={rtsp_url}, timeout={self.timeout_spin.value()}s, '
+            f'transport={transport}, media={"+".join(media_mode)}'
         )
         self.play_sequence += 1
         session_id = f'qt{self.play_sequence:02d}'
@@ -407,6 +421,7 @@ class MainWindow(QtWidgets.QWidget):
             self.timeout_spin.value(),
             enable_video=self.video_check.isChecked(),
             enable_audio=self.audio_check.isChecked(),
+            transport=transport,
             session_id=session_id,
             log_prefix=DEFAULT_LOG_PREFIX,
             parent=self,
@@ -436,6 +451,7 @@ class MainWindow(QtWidgets.QWidget):
     def on_playing_changed(self, playing: bool) -> None:
         self.play_button.setEnabled(not playing)
         self.stop_button.setEnabled(playing)
+        self.transport_combo.setEnabled(not playing)
         if not playing:
             self.play_duration_timer.stop()
         if not playing and self.player_thread is not None and not self.player_thread.isRunning():

@@ -65,6 +65,8 @@ sudo apt install -y libportaudio2
 
 若 RTSP 流需要认证，请在 URL 中包含凭据，例如 `rtsp://user:password@192.168.1.122:554/stream`。若用户名或密码包含 `@`、`:`、`/` 等保留字符，请先进行 URL 编码。
 
+`transport="udp"` 用于服务器以 UDP 单播发送 RTP（例如 VLC 默认 RTSP 模式）。默认值为 `transport="tcp"`。
+
 ```python
 import asyncio
 import aio_rtsp_toolkit as aiortsp
@@ -123,7 +125,7 @@ asyncio.run(main())
 
 当前服务器行为：
 
-- 传输方式为 TCP 上的 RTSP，仅支持交织的 RTP/RTCP
+- 传输方式支持 RTSP/TCP 交织 RTP/RTCP，以及 UDP 单播 RTP/AVP
 - 文件相对于配置根目录解析
 - 拒绝根目录外的文件
 - 不支持的编解码器会跳过，不会转码
@@ -160,6 +162,7 @@ rtsp://127.0.0.1:8554/zhongli.wav?play_count=0
 
 ### 会话说明
 
+- `transport="udp"` 使用 UDP 单播 RTP/AVP；默认为 `transport="tcp"`（交织 RTP/RTCP）
 - 单路媒体会话可使用 `enable_video=False` 或 `enable_audio=False`
 - `enable_video` 与 `enable_audio` 至少有一个必须为 `True`
 - `iter_events(stop_event)` 可接受 `threading.Event` 或 `asyncio.Event`
@@ -266,9 +269,11 @@ rtsp-client-cli -u rtsp://127.0.0.1:8554/morning_h264.mp4
 
 ## API 摘要
 
-### `RtspSession(rtsp_url, forward_address=None, timeout=4, session_id=None, enable_video=True, enable_audio=True, log_type=RtspClientMsgType.RTSP, log_prefix='')`
+### `RtspSession(rtsp_url, forward_address=None, timeout=4, session_id=None, enable_video=True, enable_audio=True, transport="tcp", log_type=RtspClientMsgType.RTSP, log_prefix='')`
 
 高层可复用 RTSP 会话对象。配合 `async with` 使用，通过 `iter_events()` 消费事件。
+
+`transport` 选择 SETUP 时的 RTP 传输方式：`"tcp"` 为 RTSP 连接上的交织 RTP/RTCP（默认）；`"udp"` 为 UDP 单播 RTP/AVP。
 
 `forward_address` 可在保留原始 RTSP URL 的同时，通过另一 TCP 端点连接（例如中继、隧道或转发主机）。
 
@@ -276,7 +281,7 @@ rtsp-client-cli -u rtsp://127.0.0.1:8554/morning_h264.mp4
 
 启动会话，产出类型化事件，并在迭代结束或失败时关闭套接字。
 
-### `open_session(rtsp_url, forward_address=None, timeout=4, session_id=None, enable_video=True, enable_audio=True, log_type=RtspClientMsgType.RTSP, log_prefix='') -> RtspSession`
+### `open_session(rtsp_url, forward_address=None, timeout=4, session_id=None, enable_video=True, enable_audio=True, transport="tcp", log_type=RtspClientMsgType.RTSP, log_prefix='') -> RtspSession`
 
 返回 `RtspSession` 的便捷辅助函数。
 
